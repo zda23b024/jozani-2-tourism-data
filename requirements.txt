@@ -1,0 +1,4 @@
+pandas
+playwright
+psycopg[binary]
+python-dateutil

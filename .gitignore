@@ -1,0 +1,39 @@
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environment
+.venv/
+
+# Secrets
+.env
+!.env.example
+
+# Browser session/cache
+browser/*_browser_profile/
+!browser/.gitkeep
+
+# Generated output
+output/csv/*
+output/json/*
+!output/csv/.gitkeep
+!output/json/.gitkeep
+
+# Local temp files
+.tmp/
+tmp/
+*.tmp
+*.log
+
+# Excel lock/temp files
+~$*.xlsx
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
