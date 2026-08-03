@@ -15,6 +15,7 @@ from config.configuration import (
     MAX_HOTEL_PAGES,
     ROOMS,
     ROWS_PER_PAGE,
+    SEARCH_API_CAPTURE_TIMEOUT_SECONDS,
     SEARCH_TERM,
     SEARCH_URL,
 )
@@ -278,7 +279,14 @@ async def wait_for_initial_request(page: Page) -> Request | None:
             continue
 
     try:
-        await asyncio.wait_for(request_found.wait(), timeout=120)
+        print(
+            "Final wait for search API request: "
+            f"{SEARCH_API_CAPTURE_TIMEOUT_SECONDS} seconds..."
+        )
+        await asyncio.wait_for(
+            request_found.wait(),
+            timeout=SEARCH_API_CAPTURE_TIMEOUT_SECONDS,
+        )
     except asyncio.TimeoutError:
         pass
     return captured_request

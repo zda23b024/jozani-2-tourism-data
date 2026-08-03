@@ -10,6 +10,7 @@ from config.configuration import (
     ATTRACTIONS_DEST_ID,
     ATTRACTIONS_PER_PAGE,
     ATTRACTIONS_URL,
+    ATTRACTION_API_CAPTURE_TIMEOUT_SECONDS,
     CHECKIN,
     CHECKOUT,
     MAX_ATTRACTION_PAGES,
@@ -80,7 +81,14 @@ async def wait_for_attraction_request(page: Page) -> Request | None:
             continue
 
     try:
-        await asyncio.wait_for(request_found.wait(), timeout=90)
+        print(
+            "Final wait for attractions API request: "
+            f"{ATTRACTION_API_CAPTURE_TIMEOUT_SECONDS} seconds..."
+        )
+        await asyncio.wait_for(
+            request_found.wait(),
+            timeout=ATTRACTION_API_CAPTURE_TIMEOUT_SECONDS,
+        )
     except asyncio.TimeoutError:
         pass
     finally:
