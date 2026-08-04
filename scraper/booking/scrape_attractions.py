@@ -14,6 +14,8 @@ from config.configuration import (
     CHECKIN,
     CHECKOUT,
     MAX_ATTRACTION_PAGES,
+    MAX_REVIEW_PAGES_PER_HOTEL,
+    REVIEWS_PER_PAGE,
 )
 from utils.browser_helpers import (
     accept_cookies,
@@ -21,7 +23,15 @@ from utils.browser_helpers import (
     fetch_graphql_page,
     parse_request_body,
 )
-from utils.helpers import first_nonempty, join_values, nested_get
+from utils.helpers import first_nonempty, join_values, nested_get, stable_review_id
+from scraper.booking.scrape_reviews import (
+    find_review_items,
+    normalize_review,
+    review_cutoff_date,
+    review_seen_key,
+    should_collect_review,
+    update_review_pagination,
+)
 
 
 def is_attraction_search_request(request: Request) -> bool:
@@ -39,6 +49,48 @@ def is_attraction_search_request(request: Request) -> bool:
         and "products" in query
         and int(input_data.get("limit") or 0) > 0
     )
+
+
+def is_attraction_review_request(request: Request) -> bool:
+    if "/dml/graphql" not in request.url or request.method != "POST":
+        return False
+    body = parse_request_body(request)
+    if not body:
+        return False
+    operation_name = str(body.get("operationName") or "").lower()
+    query = str(body.get("query") or "").lower()
+    combined = f"{operation_name}\n{query}"
+    return (
+        "review" in combined
+        and "attractionsproduct" in combined
+        and "searchproducts" not in combined
+    )
+
+
+def attraction_source_place_id(attraction: dict[str, Any]) -> str:
+    value = attraction.get("attraction_id")
+    if value not in (None, ""):
+        return str(value)
+    return str(attraction.get("name") or "").strip().lower().replace(" ", "_")
+
+
+def attraction_place_id(source_place_id: str) -> str:
+    return f"booking:attraction:place:{source_place_id}"
+
+
+def attraction_place_source_id(source_place_id: str) -> str:
+    return f"booking:attraction:listing:{source_place_id}"
+
+
+def prepare_attraction_review(review: dict[str, Any], attraction: dict[str, Any]) -> dict[str, Any]:
+    source_place_id = attraction_source_place_id(attraction)
+    return {
+        **review,
+        "source": "booking",
+        "source_place_id": source_place_id,
+        "place_id": attraction_place_id(source_place_id),
+        "place_source_id": attraction_place_source_id(source_place_id),
+    }
 
 
 async def wait_for_attraction_request(page: Page) -> Request | None:
@@ -98,6 +150,66 @@ async def wait_for_attraction_request(page: Page) -> Request | None:
             pass
 
     return captured_request
+
+
+async def wait_for_attraction_review_request(
+    page: Page,
+    attraction: dict[str, Any],
+) -> Request | None:
+    captured_request = None
+    request_found = asyncio.Event()
+
+    async def request_handler(request: Request) -> None:
+        nonlocal captured_request
+        if captured_request is None and is_attraction_review_request(request):
+            captured_request = request
+            request_found.set()
+            print("  Captured attraction reviews API request.")
+
+    page.on("request", request_handler)
+    try:
+        url = attraction.get("property_url")
+        if not url:
+            return None
+        await page.goto(url, wait_until="domcontentloaded", timeout=120_000)
+        await accept_cookies(page)
+        await page.wait_for_timeout(2500)
+
+        for selector in [
+            'button:has-text("Reviews")',
+            'a:has-text("Reviews")',
+            'button:has-text("Guest reviews")',
+            'a:has-text("Guest reviews")',
+            '[data-testid*="review"]',
+        ]:
+            if request_found.is_set():
+                break
+            try:
+                target = page.locator(selector).first
+                if await target.is_visible(timeout=1000):
+                    await target.click()
+                    await page.wait_for_timeout(2500)
+            except Exception:
+                continue
+
+        for _ in range(3):
+            if request_found.is_set():
+                break
+            await page.evaluate(
+                'window.scrollTo({top: document.body.scrollHeight, behavior: "smooth"})'
+            )
+            await page.wait_for_timeout(2000)
+
+        try:
+            await asyncio.wait_for(request_found.wait(), timeout=15)
+        except asyncio.TimeoutError:
+            pass
+        return captured_request
+    finally:
+        try:
+            page.remove_listener("request", request_handler)
+        except Exception:
+            pass
 
 
 def photo_url(photo: Any) -> str | None:
@@ -381,3 +493,134 @@ async def scrape_attractions_in_context(
         return list(all_attractions.values())
     finally:
         await page.close()
+
+
+async def scrape_reviews_for_attraction(
+    page: Page,
+    attraction: dict[str, Any],
+    existing_source_review_ids: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    existing_source_review_ids = existing_source_review_ids or set()
+    try:
+        review_request = await wait_for_attraction_review_request(page, attraction)
+    except Exception as error:
+        print(f"  Attraction review page could not be opened. Skipping: {error}")
+        return []
+
+    if review_request is None:
+        print("  No attraction review API request captured.")
+        return []
+
+    original_body = parse_request_body(review_request)
+    if not isinstance(original_body, dict):
+        print("  Could not parse attraction review request body.")
+        return []
+
+    endpoint_url = review_request.url
+    headers = await build_fetch_headers(review_request)
+    reviews: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    cutoff_date = review_cutoff_date()
+
+    for page_number in range(MAX_REVIEW_PAGES_PER_HOTEL):
+        offset = page_number * REVIEWS_PER_PAGE
+        page_body = json.loads(json.dumps(original_body))
+        update_review_pagination(page_body, offset)
+        try:
+            payload = await fetch_graphql_page(
+                page=page,
+                endpoint_url=endpoint_url,
+                headers=headers,
+                body=page_body,
+            )
+        except Exception as error:
+            print(f"  Attraction review page {page_number + 1} failed: {error}")
+            break
+
+        raw_reviews = find_review_items(payload)
+        if not raw_reviews:
+            print(f"  Attraction reviews page {page_number + 1}: 0 reviews")
+            break
+
+        added = 0
+        skipped = 0
+        existing_encountered = False
+        for raw_review in raw_reviews:
+            review = prepare_attraction_review(
+                normalize_review(raw_review, {"hotel_id": attraction_source_place_id(attraction)}),
+                attraction,
+            )
+            key = review_seen_key(review)
+            source_review_id = stable_review_id(review)
+            collect, should_stop, _reason = should_collect_review(
+                review,
+                source_review_id,
+                existing_source_review_ids,
+                None,
+                cutoff_date,
+            )
+            if not collect:
+                skipped += 1
+                if should_stop:
+                    existing_encountered = True
+                continue
+            if key not in seen_keys:
+                seen_keys.add(key)
+                reviews.append(review)
+                added += 1
+
+        print(
+            f"  Attraction reviews page {page_number + 1}: "
+            f"received {len(raw_reviews)}, new {added}, skipped {skipped}, "
+            f"total {len(reviews)}"
+        )
+        if existing_encountered:
+            print("  Existing attraction review reached. Stopping collection.")
+            break
+        if len(raw_reviews) < REVIEWS_PER_PAGE:
+            break
+        await page.wait_for_timeout(800)
+
+    return reviews
+
+
+async def scrape_reviews_for_attractions(
+    context: BrowserContext,
+    attractions: list[dict[str, Any]],
+    existing_review_ids_by_place_source_id: dict[str, set[str]] | None = None,
+) -> list[dict[str, Any]]:
+    existing_review_ids_by_place_source_id = existing_review_ids_by_place_source_id or {}
+    reviewable_attractions = [
+        attraction
+        for attraction in attractions
+        if attraction.get("property_url")
+    ]
+    all_reviews: list[dict[str, Any]] = []
+    page = await context.new_page()
+    try:
+        print()
+        print("=" * 60)
+        print("COLLECTING ATTRACTION REVIEWS")
+        print("=" * 60)
+        print(f"Attractions with URLs: {len(reviewable_attractions)}")
+        for index, attraction in enumerate(reviewable_attractions, start=1):
+            print(
+                f"[{index}/{len(reviewable_attractions)}] "
+                f"{attraction.get('name') or attraction.get('attraction_id')}"
+            )
+            source_place_id = attraction_source_place_id(attraction)
+            place_source_id = attraction_place_source_id(source_place_id)
+            try:
+                reviews = await scrape_reviews_for_attraction(
+                    page,
+                    attraction,
+                    existing_review_ids_by_place_source_id.get(place_source_id, set()),
+                )
+            except Exception as error:
+                print(f"  Attraction review collection failed. Skipping: {error}")
+                reviews = []
+            all_reviews.extend(reviews)
+            await page.wait_for_timeout(1000)
+    finally:
+        await page.close()
+    return all_reviews

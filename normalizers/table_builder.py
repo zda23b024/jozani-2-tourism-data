@@ -825,6 +825,7 @@ def build_all_tables(
     )
     tables["reviewers"] = normalize_reviewers(reviews, now)
     tables["reviews"] = normalize_reviews(reviews, hotels, now)
+    tables["review_responses"] = normalize_review_responses(reviews, hotels, now)
     tables["scraping_runs"] = [scraping_run]
     tables["availability_offers"] = normalize_availability_offers(
         hotels,

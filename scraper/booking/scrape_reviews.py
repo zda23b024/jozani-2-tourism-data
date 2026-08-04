@@ -359,7 +359,11 @@ async def scrape_reviews_for_hotel(
     existing_source_review_ids = normalized_state["source_review_ids"]
     newest_review_date = normalized_state["newest_review_date"]
     cutoff_date = review_cutoff_date()
-    review_request = await wait_for_review_request(page, hotel)
+    try:
+        review_request = await wait_for_review_request(page, hotel)
+    except Exception as error:
+        print(f"  Review page could not be opened. Skipping hotel: {error}")
+        return []
     if review_request is None:
         print("  No review API request captured. Trying reviewlist fallback.")
         return await scrape_reviewlist_fallback(
@@ -639,11 +643,15 @@ async def scrape_reviews_for_hotels(
         for index, hotel in enumerate(available_hotels, start=1):
             print(f"[{index}/{len(available_hotels)}] {hotel.get('name') or hotel.get('hotel_id')}")
             hotel_id = str(hotel.get("hotel_id") or "")
-            reviews = await scrape_reviews_for_hotel(
-                review_page,
-                hotel,
-                incremental_state_by_hotel.get(hotel_id, {}),
-            )
+            try:
+                reviews = await scrape_reviews_for_hotel(
+                    review_page,
+                    hotel,
+                    incremental_state_by_hotel.get(hotel_id, {}),
+                )
+            except Exception as error:
+                print(f"  Review collection failed. Skipping hotel: {error}")
+                reviews = []
             all_reviews.extend(reviews)
             await review_page.wait_for_timeout(1200)
     finally:

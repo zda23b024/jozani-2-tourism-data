@@ -1,9 +1,18 @@
 import asyncio
 
 from config.configuration import BOOKING_BROWSER_PROFILE_DIR, LOG_DIR, ensure_project_dirs
-from database.create_tables import fetch_existing_review_state_by_hotel, save_to_postgres
+from database.create_tables import (
+    fetch_existing_review_ids_by_place_source_ids,
+    fetch_existing_review_state_by_hotel,
+    save_to_postgres,
+)
 from normalizers.table_builder import build_all_tables
-from scraper.booking.scrape_attractions import scrape_attractions_in_context
+from scraper.booking.scrape_attractions import (
+    attraction_place_source_id,
+    attraction_source_place_id,
+    scrape_attractions_in_context,
+    scrape_reviews_for_attractions,
+)
 from scraper.booking.scrape_reviews import scrape_reviews_for_hotels
 from scraper.booking.scrape_stays import scrape_hotels_in_context
 from utils.browser_helpers import close_context, launch_context
@@ -33,6 +42,21 @@ async def main() -> None:
             )
 
         attractions = await scrape_attractions_in_context(booking_context)
+        if attractions:
+            attraction_place_source_ids = [
+                attraction_place_source_id(attraction_source_place_id(attraction))
+                for attraction in attractions
+            ]
+            existing_attraction_review_ids = fetch_existing_review_ids_by_place_source_ids(
+                attraction_place_source_ids
+            )
+            reviews.extend(
+                await scrape_reviews_for_attractions(
+                    booking_context,
+                    attractions,
+                    existing_attraction_review_ids,
+                )
+            )
     finally:
         await close_context(booking_context)
 
