@@ -23,7 +23,14 @@ from utils.browser_helpers import (
     fetch_graphql_page,
     parse_request_body,
 )
-from utils.helpers import first_nonempty, join_values, nested_get, stable_review_id
+from utils.helpers import (
+    first_nonempty,
+    join_values,
+    nested_get,
+    normalize_booking_url,
+    safe_filename,
+    stable_review_id,
+)
 from scraper.booking.scrape_reviews import (
     find_review_items,
     normalize_review,
@@ -212,6 +219,123 @@ async def wait_for_attraction_review_request(
             pass
 
 
+def clean_visible_review_text(value: str) -> str:
+    return " ".join(str(value or "").split()).strip()
+
+
+async def visible_attraction_review_from_page(
+    page: Page,
+    attraction: dict[str, Any],
+) -> dict[str, Any] | None:
+    try:
+        data = await page.evaluate(
+            """
+            () => {
+                const cards = Array.from(document.querySelectorAll('div, section, article'));
+                const card = cards.find((node) => {
+                    const text = (node.innerText || '').trim();
+                    return text.includes('What guests loved most') && text.length < 1200;
+                });
+                if (!card) return null;
+                const lines = (card.innerText || '')
+                    .split('\\n')
+                    .map((line) => line.trim())
+                    .filter(Boolean)
+                    .filter((line) => !/^\\d+(\\.\\d+)?$/.test(line))
+                    .filter((line) => !/^reviews?$/i.test(line))
+                    .filter((line) => !/^exceptional|superb|good|fabulous$/i.test(line));
+                const headingIndex = lines.findIndex((line) => /What guests loved most/i.test(line));
+                const useful = headingIndex >= 0 ? lines.slice(headingIndex + 1) : lines;
+                const reviewerName = useful[0] || null;
+                const reviewText = useful.slice(1).join(' ') || null;
+                return {reviewerName, reviewText, rawText: lines.join('\\n')};
+            }
+            """
+        )
+    except Exception:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    review_text = clean_visible_review_text(str(data.get("reviewText") or ""))
+    reviewer_name = clean_visible_review_text(str(data.get("reviewerName") or ""))
+    if not review_text or len(review_text) < 10:
+        return None
+
+    source_place_id = attraction_source_place_id(attraction)
+    return prepare_attraction_review(
+        {
+            "review_id": f"visible:{source_place_id}:{reviewer_name}:{review_text[:80]}",
+            "hotel_id": source_place_id,
+            "reviewer_name": reviewer_name or None,
+            "reviewer_country": None,
+            "review_score": attraction.get("review_score"),
+            "review_title": "What guests loved most",
+            "review_text": review_text,
+            "positive_text": review_text,
+            "negative_text": None,
+            "review_date": CHECKIN,
+            "stayed_date": None,
+            "room_name": None,
+            "language": None,
+            "response_id": None,
+            "response_text": None,
+            "response_date": None,
+            "responder_name": None,
+            "responder_role": None,
+        },
+        attraction,
+    )
+
+
+async def scrape_visible_attraction_review_cards(
+    page: Page,
+    attraction: dict[str, Any],
+    existing_source_review_ids: set[str],
+) -> list[dict[str, Any]]:
+    reviews: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    async def add_current_card() -> None:
+        review = await visible_attraction_review_from_page(page, attraction)
+        if not review:
+            return
+        source_review_id = stable_review_id(review)
+        if source_review_id in existing_source_review_ids or source_review_id in seen_ids:
+            return
+        seen_ids.add(source_review_id)
+        reviews.append(review)
+
+    await add_current_card()
+
+    for _ in range(12):
+        clicked = False
+        for selector in [
+            'button[aria-label="Next"]',
+            'button:has-text("›")',
+            'button:has-text(">")',
+            '[role="button"][aria-label="Next"]',
+        ]:
+            try:
+                target = page.locator(selector).last
+                if await target.is_visible(timeout=600) and await target.is_enabled(timeout=600):
+                    await target.click()
+                    await page.wait_for_timeout(800)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+        if not clicked:
+            break
+        before = len(reviews)
+        await add_current_card()
+        if len(reviews) == before:
+            continue
+
+    print(f"  Visible attraction review cards collected: {len(reviews)}")
+    return reviews
+
+
 def photo_url(photo: Any) -> str | None:
     if isinstance(photo, str):
         return photo
@@ -299,6 +423,56 @@ def extract_taxonomy(product: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def find_attraction_url(value: Any) -> str | None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            key_name = str(key).lower()
+            if key_name in {
+                "url",
+                "uri",
+                "href",
+                "deeplink",
+                "canonicalurl",
+                "weburl",
+                "producturl",
+            }:
+                normalized = normalize_booking_url(child)
+                if normalized and "/attractions/" in normalized:
+                    return normalized
+            found = find_attraction_url(child)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = find_attraction_url(child)
+            if found:
+                return found
+    elif isinstance(value, str) and "/attractions/" in value:
+        return normalize_booking_url(value)
+    return None
+
+
+def fallback_attraction_url(product: dict[str, Any]) -> str:
+    product_id = str(product.get("id") or "").strip()
+    slug = str(product.get("slug") or "").strip().strip("/")
+    if not slug:
+        slug = safe_filename(product.get("name")).replace("_", "-")
+
+    path_part = slug
+    if product_id and slug and not slug.lower().startswith(product_id.lower()):
+        path_part = f"{product_id.lower()}-{slug}"
+    elif product_id and not slug:
+        path_part = product_id.lower()
+
+    return (
+        "https://www.booking.com/attractions/tz/"
+        f"{quote_plus(path_part)}.html"
+        f"?selected_currency=TZS&source=searchresults-product-card"
+        f"&start_date={quote_plus(CHECKIN)}&end_date={quote_plus(CHECKOUT)}"
+        f"&date={quote_plus(CHECKIN)}&ufi={quote_plus(ATTRACTIONS_DEST_ID)}"
+    )
+
+
 def normalize_attraction(product: dict[str, Any]) -> dict[str, Any]:
     address = extract_address(product)
     taxonomy = extract_taxonomy(product)
@@ -315,10 +489,7 @@ def normalize_attraction(product: dict[str, Any]) -> dict[str, Any]:
         "name": product.get("name"),
         "description": product.get("description"),
         "description_summary": product.get("shortDescription"),
-        "property_url": (
-            "https://www.booking.com/attractions/"
-            f"{quote_plus(str(product.get('slug') or product.get('id') or ''))}.html"
-        ),
+        "property_url": find_attraction_url(product) or fallback_attraction_url(product),
         "address": address.get("address"),
         "city": first_nonempty(address.get("city"), nested_get(product, "ufiDetails", "bCityName")),
         "country_code": address.get("country"),
@@ -509,7 +680,11 @@ async def scrape_reviews_for_attraction(
 
     if review_request is None:
         print("  No attraction review API request captured.")
-        return []
+        return await scrape_visible_attraction_review_cards(
+            page,
+            attraction,
+            existing_source_review_ids,
+        )
 
     original_body = parse_request_body(review_request)
     if not isinstance(original_body, dict):
