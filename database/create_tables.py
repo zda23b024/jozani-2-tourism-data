@@ -3,6 +3,7 @@ import math
 from datetime import date, datetime
 from typing import Any
 
+from config.configuration import ADULTS, CHILDREN, ROOMS
 from config.database import database_url, ensure_database_exists, psycopg
 from utils.helpers import parse_date
 
@@ -694,7 +695,7 @@ def upsert_place_source(cursor: Any, row: dict, place_id: int, source_id: int) -
             numeric_value(row.get("longitude")),
             numeric_value(row.get("star_rating")),
             numeric_value(row.get("review_score")),
-            int_value(row.get("review_count")),
+            int_value(row.get("review_count")) or 0,
             row.get("created_at"),
             row.get("last_scraped_at"),
             db_value(row.get("raw_json")) or "{}",
@@ -1049,9 +1050,9 @@ def save_to_postgres(tables: dict[str, list[dict]]) -> None:
                         checkin,
                         checkout,
                         nights,
-                        int_value(row.get("adults")) or 0,
-                        int_value(row.get("children")) or 0,
-                        int_value(row.get("rooms")) or 0,
+                        int_value(row.get("adults")) or ADULTS,
+                        int_value(row.get("children")) or CHILDREN,
+                        int_value(row.get("rooms")) or ROOMS,
                         currency_code(row.get("currency")),
                         numeric_value(row.get("price")),
                         numeric_value(row.get("price")),
