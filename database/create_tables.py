@@ -28,6 +28,16 @@ def db_value(value: Any) -> Any:
     return value
 
 
+def text_limit(value: Any, max_length: int) -> str | None:
+    cleaned = db_value(value)
+    if cleaned is None:
+        return None
+    text = str(cleaned).strip()
+    if not text:
+        return None
+    return text[:max_length]
+
+
 def date_value(value: Any) -> date | None:
     return parse_date(value)
 
@@ -687,10 +697,10 @@ def upsert_place_source(cursor: Any, row: dict, place_id: int, source_id: int) -
         (
             place_id,
             source_id,
-            row.get("source_place_id"),
+            text_limit(row.get("source_place_id"), 150),
             row.get("source_url"),
             row.get("source_name"),
-            row.get("source_category"),
+            text_limit(row.get("source_category"), 150),
             numeric_value(row.get("latitude")),
             numeric_value(row.get("longitude")),
             numeric_value(row.get("star_rating")),
@@ -826,8 +836,8 @@ def save_to_postgres(tables: dict[str, list[dict]]) -> None:
                     RETURNING amenity_id
                     """,
                     (
-                        row.get("amenity_name"),
-                        row.get("amenity_category"),
+                        text_limit(row.get("amenity_name"), 200),
+                        text_limit(row.get("amenity_category"), 100),
                         row.get("created_at"),
                         row.get("updated_at"),
                     ),
@@ -889,6 +899,7 @@ def save_to_postgres(tables: dict[str, list[dict]]) -> None:
 
             reviewer_ids: dict[str, int] = {}
             for row in tables.get("reviewers", []):
+                source_reviewer_id = text_limit(row.get("source_reviewer_id"), 150)
                 reviewer_ids[str(row.get("reviewer_id"))] = fetch_one_id(
                     cursor,
                     """
@@ -907,10 +918,10 @@ def save_to_postgres(tables: dict[str, list[dict]]) -> None:
                     """,
                     (
                         source_code_id,
-                        row.get("source_reviewer_id"),
-                        row.get("reviewer_name"),
+                        source_reviewer_id,
+                        text_limit(row.get("reviewer_name"), 200),
                         str(row.get("country") or "")[:2].upper() or None,
-                        row.get("reviewer_level"),
+                        text_limit(row.get("reviewer_level"), 100),
                         row.get("profile_image"),
                         row.get("created_at"),
                         row.get("updated_at"),
@@ -924,6 +935,7 @@ def save_to_postgres(tables: dict[str, list[dict]]) -> None:
                     continue
                 reviewer_id = reviewer_ids.get(str(row.get("reviewer_id")))
                 review_date = date_value(row.get("review_date")) or datetime.utcnow().date()
+                source_review_id = text_limit(row.get("source_review_id"), 150)
                 cursor.execute(
                     """
                     INSERT INTO reviews (
@@ -942,7 +954,7 @@ def save_to_postgres(tables: dict[str, list[dict]]) -> None:
                     (
                         place_source_id,
                         reviewer_id,
-                        row.get("source_review_id"),
+                        source_review_id,
                         row.get("review_title"),
                         row.get("review_text"),
                         row.get("positive_text"),
@@ -968,7 +980,7 @@ def save_to_postgres(tables: dict[str, list[dict]]) -> None:
                         SELECT review_id FROM reviews
                         WHERE place_source_id = %s AND source_review_id = %s
                         """,
-                        (place_source_id, row.get("source_review_id")),
+                        (place_source_id, source_review_id),
                     )
                     fetched = cursor.fetchone()
                     if fetched:
@@ -978,6 +990,7 @@ def save_to_postgres(tables: dict[str, list[dict]]) -> None:
                 review_id = review_ids.get(str(row.get("review_id")))
                 if not review_id or not row.get("response_text"):
                     continue
+                source_response_id = text_limit(row.get("source_response_id"), 150)
                 cursor.execute(
                     """
                     INSERT INTO review_responses (
@@ -994,9 +1007,9 @@ def save_to_postgres(tables: dict[str, list[dict]]) -> None:
                     """,
                     (
                         review_id,
-                        row.get("source_response_id"),
-                        row.get("responder_name"),
-                        row.get("responder_role"),
+                        source_response_id,
+                        text_limit(row.get("responder_name"), 200),
+                        text_limit(row.get("responder_role"), 100),
                         row.get("response_text"),
                         date_value(row.get("response_date")),
                         row.get("created_at"),

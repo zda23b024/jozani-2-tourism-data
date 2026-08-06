@@ -1,4 +1,5 @@
 import asyncio
+import argparse
 
 from config.configuration import BOOKING_BROWSER_PROFILE_DIR, LOG_DIR, ensure_project_dirs
 from database.create_tables import (
@@ -20,7 +21,18 @@ from utils.file_manager import save_all_table_outputs
 from utils.run_logging import RunLogger
 
 
-async def main() -> None:
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Collect Booking.com tourism data.")
+    parser.add_argument(
+        "--only",
+        choices=["all", "hotels", "attractions"],
+        default="all",
+        help="Limit the run to hotels, attractions, or the full collection.",
+    )
+    return parser.parse_args()
+
+
+async def main(only: str = "all") -> None:
     ensure_project_dirs()
     hotels = []
     reviews = []
@@ -31,7 +43,8 @@ async def main() -> None:
         "Booking.com",
     )
     try:
-        hotels = await scrape_hotels_in_context(booking_context)
+        if only in {"all", "hotels"}:
+            hotels = await scrape_hotels_in_context(booking_context)
 
         if hotels:
             existing_review_state = fetch_existing_review_state_by_hotel(hotels)
@@ -41,7 +54,8 @@ async def main() -> None:
                 existing_review_state,
             )
 
-        attractions = await scrape_attractions_in_context(booking_context)
+        if only in {"all", "attractions"}:
+            attractions = await scrape_attractions_in_context(booking_context)
         if attractions:
             attraction_place_source_ids = [
                 attraction_place_source_id(attraction_source_place_id(attraction))
@@ -71,6 +85,7 @@ async def main() -> None:
 
 if __name__ == "__main__":
     ensure_project_dirs()
+    args = parse_args()
     with RunLogger(LOG_DIR) as log_path:
-        asyncio.run(main())
+        asyncio.run(main(args.only))
         print(f"Completed run. Log saved to: {log_path}")

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 from copy import deepcopy
 from typing import Any
 from urllib.parse import quote_plus
@@ -171,7 +172,7 @@ async def wait_for_attraction_review_request(
         if captured_request is None and is_attraction_review_request(request):
             captured_request = request
             request_found.set()
-            print("  Captured attraction reviews API request.")
+            print("  Review panel opened; checking structured review data.")
 
     page.on("request", request_handler)
     try:
@@ -181,12 +182,20 @@ async def wait_for_attraction_review_request(
         await page.goto(url, wait_until="domcontentloaded", timeout=120_000)
         await accept_cookies(page)
         await page.wait_for_timeout(2500)
+        page_title = await page.title()
+        if is_bad_attraction_landing_page(page.url, page_title):
+            print(f"  Skipping invalid attraction page: {page_title} | {page.url}")
+            return None
 
         for selector in [
             'button:has-text("Reviews")',
             'a:has-text("Reviews")',
+            'button:has-text("reviews")',
+            'a:has-text("reviews")',
             'button:has-text("Guest reviews")',
             'a:has-text("Guest reviews")',
+            'text=/\\d+\\s+reviews/i',
+            '[aria-label*="review" i]',
             '[data-testid*="review"]',
         ]:
             if request_found.is_set():
@@ -223,6 +232,265 @@ def clean_visible_review_text(value: str) -> str:
     return " ".join(str(value or "").split()).strip()
 
 
+def is_bad_attraction_landing_page(url: Any, title: Any, body_text: Any = "") -> bool:
+    combined = " ".join(
+        str(value or "").lower()
+        for value in [url, title, body_text[:500] if isinstance(body_text, str) else ""]
+    )
+    bad_markers = [
+        "viator terms",
+        "terms & conditions",
+        "/attractions/terms",
+        "privacy statement",
+        "/attractions/privacy",
+        "help centre",
+        "/attractions/help",
+    ]
+    return any(marker in combined for marker in bad_markers)
+
+
+def parse_price_amount(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    text = str(value)
+    match = re.search(r"[\d,.]+", text)
+    if not match:
+        return None
+    try:
+        return float(match.group(0).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def parse_review_count(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    match = re.search(r"([\d,]+)\s+reviews?", str(value), flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return int(match.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def parse_review_score(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    match = re.search(
+        r"\b(\d+(?:\.\d+)?)\b\s*(?:Exceptional|Superb|Excellent|Very good|Good)",
+        str(value),
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except ValueError:
+        return None
+
+
+def merge_detail_text(existing: Any, new_value: Any, separator: str = "; ") -> str | None:
+    values = []
+    for value in [existing, new_value]:
+        if value in (None, "", [], {}):
+            continue
+        if isinstance(value, list):
+            values.extend(str(item).strip() for item in value)
+        else:
+            values.extend(str(item).strip() for item in str(value).split(separator))
+    cleaned = [value for value in values if value]
+    return separator.join(dict.fromkeys(cleaned)) if cleaned else None
+
+
+async def scrape_attraction_detail_page(
+    page: Page,
+    attraction: dict[str, Any],
+) -> dict[str, Any]:
+    url = attraction.get("property_url")
+    if not url:
+        return {}
+
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=120_000)
+        await accept_cookies(page)
+        await page.wait_for_timeout(2500)
+        page_title = await page.title()
+        if is_bad_attraction_landing_page(page.url, page_title):
+            print(f"  Invalid attraction detail URL opened: {page_title} | {page.url}")
+            return {"property_url": None}
+        await page.evaluate(
+            'window.scrollTo({top: Math.min(document.body.scrollHeight, 4500), behavior: "smooth"})'
+        )
+        await page.wait_for_timeout(1500)
+    except Exception as error:
+        print(f"  Attraction detail page failed for {attraction.get('name')}: {error}")
+        return {}
+
+    try:
+        data = await page.evaluate(
+            """
+            () => {
+                const text = (el) => (el?.innerText || el?.textContent || '').trim();
+                const unique = (items) => [...new Set(items.map(v => (v || '').trim()).filter(Boolean))];
+                const pickText = (selectors) => {
+                    for (const selector of selectors) {
+                        const value = text(document.querySelector(selector));
+                        if (value) return value;
+                    }
+                    return null;
+                };
+                const bodyText = document.body?.innerText || '';
+                const lines = unique(
+                    bodyText.split('\\n').map(line => line.trim())
+                ).filter(line => line.length >= 3 && line.length <= 220);
+                const breadcrumbs = unique(
+                    [...document.querySelectorAll('nav a, [aria-label*="breadcrumb" i] a')]
+                        .map(text)
+                );
+                const images = unique(
+                    [...document.images]
+                        .map(img => img.currentSrc || img.src || img.getAttribute('data-src'))
+                        .filter(src => src && /^https?:/.test(src))
+                );
+                const title = pickText(['h1', '[data-testid*="title"]']);
+                const subtitle = pickText([
+                    '[data-testid*="subtitle"]',
+                    '[data-testid*="description"]',
+                    'main p'
+                ]);
+                const description = pickText([
+                    '[data-testid*="description"]',
+                    '[data-testid*="overview"]',
+                    '[data-testid*="about"]',
+                    'section'
+                ]);
+                const featureLines = lines.filter(line =>
+                    /free cancellation|duration|guide|pickup|mobile ticket|instant confirmation|included|language/i.test(line)
+                ).slice(0, 30);
+                const cancellationLine = lines.find(line => /cancellation/i.test(line)) || null;
+                return {
+                    title,
+                    subtitle,
+                    description,
+                    bodyText,
+                    images,
+                    breadcrumbs,
+                    featureLines,
+                    cancellationLine
+                };
+            }
+            """
+        )
+    except Exception:
+        return {}
+
+    if not isinstance(data, dict):
+        return {}
+
+    body_text = clean_visible_review_text(str(data.get("bodyText") or ""))
+    if is_bad_attraction_landing_page(page.url, data.get("title"), body_text):
+        print(f"  Invalid attraction detail content skipped: {data.get('title')} | {page.url}")
+        return {"property_url": None}
+
+    images = data.get("images") if isinstance(data.get("images"), list) else []
+    breadcrumbs = data.get("breadcrumbs") if isinstance(data.get("breadcrumbs"), list) else []
+    feature_lines = data.get("featureLines") if isinstance(data.get("featureLines"), list) else []
+    existing_photos = attraction.get("photos") or []
+    detail_photos = list(dict.fromkeys([*existing_photos, *images]))
+
+    price_match = re.search(
+        r"(TZS|USD|US\$|EUR|GBP)\s*([\d,.]+)",
+        body_text,
+        flags=re.IGNORECASE,
+    )
+    raw_value = attraction.get("raw") or {}
+    if not isinstance(raw_value, dict):
+        raw_value = {"search_payload": raw_value}
+    raw_detail = {
+        "detail_url": url,
+        "title": data.get("title"),
+        "subtitle": data.get("subtitle"),
+        "description": data.get("description"),
+        "breadcrumbs": breadcrumbs,
+        "feature_lines": feature_lines,
+        "cancellation_line": data.get("cancellationLine"),
+    }
+
+    detail = {
+        "name": attraction.get("name"),
+        "description_summary": first_nonempty(
+            attraction.get("description_summary"),
+            data.get("subtitle"),
+        ),
+        "description": first_nonempty(
+            attraction.get("description"),
+            data.get("description"),
+            data.get("subtitle"),
+        ),
+        "display_location": first_nonempty(
+            attraction.get("display_location"),
+            " > ".join(breadcrumbs[-3:]) if breadcrumbs else None,
+        ),
+        "review_score": first_nonempty(
+            attraction.get("review_score"),
+            parse_review_score(body_text),
+        ),
+        "review_count": first_nonempty(
+            attraction.get("review_count"),
+            parse_review_count(body_text),
+        ),
+        "photos": detail_photos,
+        "photo_url": first_nonempty(attraction.get("photo_url"), detail_photos[0] if detail_photos else None),
+        "features": merge_detail_text(attraction.get("features"), feature_lines),
+        "free_cancellation": first_nonempty(
+            attraction.get("free_cancellation"),
+            "free cancellation" in body_text.lower(),
+        ),
+        "cancellation_policy": first_nonempty(
+            attraction.get("cancellation_policy"),
+            data.get("cancellationLine"),
+        ),
+        "raw": {**raw_value, "detail_page": raw_detail},
+    }
+
+    if price_match:
+        detail["currency"] = "USD" if price_match.group(1).upper() == "US$" else price_match.group(1).upper()
+        detail["price"] = first_nonempty(
+            attraction.get("price"),
+            parse_price_amount(price_match.group(2)),
+        )
+
+    return {key: value for key, value in detail.items() if value not in (None, "", [], {})}
+
+
+async def enrich_attractions_with_detail_pages(
+    context: BrowserContext,
+    attractions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    if not attractions:
+        return attractions
+
+    print()
+    print("=" * 60)
+    print("ENRICHING ATTRACTION DETAIL PAGES")
+    print("=" * 60)
+    page = await context.new_page()
+    try:
+        enriched = []
+        for index, attraction in enumerate(attractions, start=1):
+            print(
+                f"[{index}/{len(attractions)}] Detail: "
+                f"{attraction.get('name') or attraction.get('attraction_id')}"
+            )
+            details = await scrape_attraction_detail_page(page, attraction)
+            enriched.append({**attraction, **details})
+            await page.wait_for_timeout(800)
+        return enriched
+    finally:
+        await page.close()
+
+
 async def visible_attraction_review_from_page(
     page: Page,
     attraction: dict[str, Any],
@@ -234,7 +502,7 @@ async def visible_attraction_review_from_page(
                 const cards = Array.from(document.querySelectorAll('div, section, article'));
                 const card = cards.find((node) => {
                     const text = (node.innerText || '').trim();
-                    return text.includes('What guests loved most') && text.length < 1200;
+                    return text.includes('What guests loved most') && text.length < 2500;
                 });
                 if (!card) return null;
                 const lines = (card.innerText || '')
@@ -288,6 +556,105 @@ async def visible_attraction_review_from_page(
     )
 
 
+async def visible_attraction_review_list_from_page(
+    page: Page,
+    attraction: dict[str, Any],
+) -> list[dict[str, Any]]:
+    try:
+        raw_reviews = await page.evaluate(
+            """
+            () => {
+                const text = (el) => (el?.innerText || el?.textContent || '').trim();
+                const roots = Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"], aside, section, div'));
+                const reviewRoot = roots.find((node) => {
+                    const value = text(node);
+                    return /Reviews/i.test(value)
+                        && /Search reviews|Sort by|Filter by|User ratings/i.test(value)
+                        && value.length < 20000;
+                });
+                if (!reviewRoot) return [];
+
+                const nodes = Array.from(reviewRoot.querySelectorAll('article, [role="listitem"], [data-testid*="review"], div'));
+                const candidates = nodes
+                    .map((node) => {
+                        const lines = text(node)
+                            .split('\\n')
+                            .map((line) => line.trim())
+                            .filter(Boolean);
+                        return {node, lines, value: lines.join('\\n')};
+                    })
+                    .filter((item) => {
+                        const value = item.value;
+                        if (value.length < 45 || value.length > 1600) return false;
+                        if (/Search reviews|Sort by|Filter by|User ratings|Review score|Time of year|Language/i.test(value)) return false;
+                        return /Posted\\s+.+\\s+on\\s+Viator/i.test(value)
+                            || item.lines.some((line) => line.length >= 45 && /\\w+\\s+\\w+/.test(line));
+                    });
+
+                const minimal = candidates.filter((item) => {
+                    return !candidates.some((other) => other !== item && item.node.contains(other.node));
+                });
+
+                return minimal.slice(0, 25).map((item) => {
+                    const lines = item.lines
+                        .filter((line) => !/^\\d+(\\.\\d+)?$/.test(line))
+                        .filter((line) => !/^(Reviews|Fabulous|Exceptional|Superb|Excellent|Very good|Good)$/i.test(line))
+                        .filter((line) => !/^Posted\\s+.+\\s+on\\s+Viator$/i.test(line));
+                    const postedLine = item.lines.find((line) => /^Posted\\s+.+\\s+on\\s+Viator$/i.test(line)) || null;
+                    const reviewerName = lines.find((line) => line.length > 1 && line.length <= 80) || null;
+                    const reviewText = lines
+                        .filter((line) => line !== reviewerName)
+                        .filter((line) => line.length >= 20)
+                        .join(' ');
+                    const dateMatch = postedLine ? postedLine.match(/^Posted\\s+(.+?)\\s+on\\s+Viator$/i) : null;
+                    return {reviewerName, reviewText, reviewDate: dateMatch ? dateMatch[1] : null, rawText: item.value};
+                });
+            }
+            """
+        )
+    except Exception:
+        return []
+
+    if not isinstance(raw_reviews, list):
+        return []
+
+    source_place_id = attraction_source_place_id(attraction)
+    reviews = []
+    for item in raw_reviews:
+        if not isinstance(item, dict):
+            continue
+        review_text = clean_visible_review_text(str(item.get("reviewText") or ""))
+        reviewer_name = clean_visible_review_text(str(item.get("reviewerName") or ""))
+        if not review_text or len(review_text) < 20:
+            continue
+        reviews.append(
+            prepare_attraction_review(
+                {
+                    "review_id": f"visible-list:{source_place_id}:{reviewer_name}:{review_text[:80]}",
+                    "hotel_id": source_place_id,
+                    "reviewer_name": reviewer_name or None,
+                    "reviewer_country": None,
+                    "review_score": attraction.get("review_score"),
+                    "review_title": "Attraction review",
+                    "review_text": review_text,
+                    "positive_text": review_text,
+                    "negative_text": None,
+                    "review_date": item.get("reviewDate") or CHECKIN,
+                    "stayed_date": None,
+                    "room_name": None,
+                    "language": None,
+                    "response_id": None,
+                    "response_text": None,
+                    "response_date": None,
+                    "responder_name": None,
+                    "responder_role": None,
+                },
+                attraction,
+            )
+        )
+    return reviews
+
+
 async def scrape_visible_attraction_review_cards(
     page: Page,
     attraction: dict[str, Any],
@@ -297,14 +664,16 @@ async def scrape_visible_attraction_review_cards(
     seen_ids: set[str] = set()
 
     async def add_current_card() -> None:
-        review = await visible_attraction_review_from_page(page, attraction)
-        if not review:
-            return
-        source_review_id = stable_review_id(review)
-        if source_review_id in existing_source_review_ids or source_review_id in seen_ids:
-            return
-        seen_ids.add(source_review_id)
-        reviews.append(review)
+        visible_reviews = await visible_attraction_review_list_from_page(page, attraction)
+        if not visible_reviews:
+            single_review = await visible_attraction_review_from_page(page, attraction)
+            visible_reviews = [single_review] if single_review else []
+        for review in visible_reviews:
+            source_review_id = stable_review_id(review)
+            if source_review_id in existing_source_review_ids or source_review_id in seen_ids:
+                continue
+            seen_ids.add(source_review_id)
+            reviews.append(review)
 
     await add_current_card()
 
@@ -332,7 +701,7 @@ async def scrape_visible_attraction_review_cards(
         if len(reviews) == before:
             continue
 
-    print(f"  Visible attraction review cards collected: {len(reviews)}")
+    print(f"  Visible attraction reviews collected: {len(reviews)}")
     return reviews
 
 
@@ -437,7 +806,7 @@ def find_attraction_url(value: Any) -> str | None:
                 "producturl",
             }:
                 normalized = normalize_booking_url(child)
-                if normalized and "/attractions/" in normalized:
+                if is_attraction_detail_url(normalized):
                     return normalized
             found = find_attraction_url(child)
             if found:
@@ -447,9 +816,35 @@ def find_attraction_url(value: Any) -> str | None:
             found = find_attraction_url(child)
             if found:
                 return found
-    elif isinstance(value, str) and "/attractions/" in value:
-        return normalize_booking_url(value)
+    elif isinstance(value, str):
+        normalized = normalize_booking_url(value)
+        if is_attraction_detail_url(normalized):
+            return normalized
     return None
+
+
+def is_attraction_detail_url(url: Any) -> bool:
+    normalized = normalize_booking_url(url)
+    if not normalized:
+        return False
+    lowered = normalized.lower()
+    if "/attractions/tz/" not in lowered:
+        return False
+    blocked_parts = [
+        "viator-terms",
+        "terms-and-conditions",
+        "/attractions/content/",
+        "/attractions/terms",
+        "/attractions/searchresults",
+        "/attractions/index",
+        "/attractions/help",
+        "/attractions/privacy",
+        "/attractions/city/",
+        "/attractions/country/",
+    ]
+    if any(part in lowered for part in blocked_parts):
+        return False
+    return ".html" in lowered
 
 
 def fallback_attraction_url(product: dict[str, Any]) -> str:
@@ -661,7 +1056,10 @@ async def scrape_attractions_in_context(
                 break
             await page.wait_for_timeout(1000)
 
-        return list(all_attractions.values())
+        return await enrich_attractions_with_detail_pages(
+            context,
+            list(all_attractions.values()),
+        )
     finally:
         await page.close()
 
@@ -714,7 +1112,17 @@ async def scrape_reviews_for_attraction(
 
         raw_reviews = find_review_items(payload)
         if not raw_reviews:
-            print(f"  Attraction reviews page {page_number + 1}: 0 reviews")
+            print(
+                f"  Structured attraction review page {page_number + 1}: "
+                "no review records returned."
+            )
+            if page_number == 0:
+                print("  Reading visible attraction reviews from the page.")
+                return await scrape_visible_attraction_review_cards(
+                    page,
+                    attraction,
+                    existing_source_review_ids,
+                )
             break
 
         added = 0
@@ -745,12 +1153,15 @@ async def scrape_reviews_for_attraction(
                 added += 1
 
         print(
-            f"  Attraction reviews page {page_number + 1}: "
+            f"  Structured attraction review page {page_number + 1}: "
             f"received {len(raw_reviews)}, new {added}, skipped {skipped}, "
             f"total {len(reviews)}"
         )
         if existing_encountered:
-            print("  Existing attraction review reached. Stopping collection.")
+            print("  Existing attraction review reached. Stopping incremental collection.")
+            break
+        if page_number > 0 and added == 0:
+            print("  No new attraction reviews found on this page. Stopping collection.")
             break
         if len(raw_reviews) < REVIEWS_PER_PAGE:
             break
