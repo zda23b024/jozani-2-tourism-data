@@ -17,9 +17,8 @@ The current configured destination is Zanzibar City, Tanzania.
 ## Production-Oriented Logic
 
 - Hotels are inserted when new and updated when already present.
-- Reviews are checked by source review ID before scraping/saving.
-- Existing reviews are ignored instead of duplicated.
-- Review scraping stops when an existing review is encountered.
+- Reviews are scraped through all available pages returned by Booking.com.
+- Existing reviews are upserted instead of duplicated.
 - Availability offers are stored historically for each scrape run.
 - Each run writes a timestamped log file under `output/logs`.
 
@@ -81,9 +80,9 @@ SEARCH_REGION = "Zanzibar"
 SEARCH_ISLAND = "Unguja"
 
 MAX_HOTEL_PAGES = 10
-MAX_ATTRACTION_PAGES = 5
-MAX_REVIEW_PAGES_PER_HOTEL = 5
-HEADLESS = True
+MAX_ATTRACTION_PAGES = 10
+MAX_REVIEW_PAGES_PER_HOTEL = None
+HEADLESS = False
 ```
 
 For Booking.com attractions, `ATTRACTIONS_DEST_ID` must match the destination.
@@ -134,7 +133,7 @@ Review-only run:
 python main.py --reviews
 ```
 
-This loads known Booking.com hotels and attractions from PostgreSQL and collects only new reviews.
+This loads known Booking.com hotels and attractions from PostgreSQL and collects all review pages currently available from Booking.com.
 
 Catalog-only refresh:
 

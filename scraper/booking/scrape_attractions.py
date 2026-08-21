@@ -17,7 +17,6 @@ from config.configuration import (
     CHECKIN,
     CHECKOUT,
     MAX_ATTRACTION_PAGES,
-    MAX_REVIEW_PAGES_PER_HOTEL,
     REVIEWS_PER_PAGE,
 )
 from utils.browser_helpers import (
@@ -37,6 +36,7 @@ from utils.helpers import (
 from scraper.booking.scrape_reviews import (
     find_review_items,
     normalize_review,
+    review_page_numbers,
     review_cutoff_date,
     should_collect_review,
 )
@@ -750,7 +750,7 @@ async def scrape_visible_attraction_review_cards(
             visible_reviews = [single_review] if single_review else []
         for review in visible_reviews:
             source_review_id = stable_review_id(review)
-            if source_review_id in existing_source_review_ids or source_review_id in seen_ids:
+            if source_review_id in seen_ids:
                 continue
             seen_ids.add(source_review_id)
             reviews.append(review)
@@ -805,8 +805,7 @@ async def scrape_visible_attraction_review_cards(
             source_review_id = stable_review_id(review)
             content_key = attraction_review_content_key(review)
             if (
-                source_review_id in existing_source_review_ids
-                or source_review_id in seen_ids
+                source_review_id in seen_ids
                 or content_key in seen_content_keys
             ):
                 continue
@@ -1485,9 +1484,6 @@ async def scrape_reviews_for_attraction(
         )
         added = 0
         for review in visible_reviews:
-            source_review_id = stable_review_id(review)
-            if source_review_id in existing_source_review_ids:
-                continue
             key = attraction_review_content_key(review)
             if key in seen_keys:
                 continue
@@ -1496,7 +1492,7 @@ async def scrape_reviews_for_attraction(
             added += 1
         return added
 
-    for page_number in range(MAX_REVIEW_PAGES_PER_HOTEL):
+    for page_number in review_page_numbers():
         page_body = json.loads(json.dumps(original_body))
         prepare_attraction_review_request_body(page_body, page_number + 1)
         try:
@@ -1530,14 +1526,13 @@ async def scrape_reviews_for_attraction(
 
         added = 0
         skipped = 0
-        existing_encountered = False
         for raw_review in raw_reviews:
             review = prepare_attraction_review(
                 normalize_review(raw_review, {"hotel_id": attraction_source_place_id(attraction)}),
                 attraction,
             )
             source_review_id = stable_review_id(review)
-            collect, should_stop, _reason = should_collect_review(
+            collect, _should_stop, _reason = should_collect_review(
                 review,
                 source_review_id,
                 existing_source_review_ids,
@@ -1546,8 +1541,6 @@ async def scrape_reviews_for_attraction(
             )
             if not collect:
                 skipped += 1
-                if should_stop:
-                    existing_encountered = True
                 continue
             content_key = attraction_review_content_key(review)
             if content_key not in seen_keys:
@@ -1560,11 +1553,8 @@ async def scrape_reviews_for_attraction(
             f"received {len(raw_reviews)}, new {added}, skipped {skipped}, "
             f"total {len(reviews)}"
         )
-        if existing_encountered:
-            print("  Existing attraction review reached. Stopping incremental collection.")
-            break
         if page_number > 0 and added == 0:
-            print("  No new attraction reviews found on this page. Stopping collection.")
+            print("  No additional attraction reviews found on this page. Stopping collection.")
             break
         if structured_total is not None and len(reviews) >= structured_total:
             print("  Reached the API-reported attraction review total.")

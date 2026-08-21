@@ -1,4 +1,5 @@
 import html
+import itertools
 import json
 import re
 from datetime import date, datetime, timedelta, timezone
@@ -81,10 +82,16 @@ def should_collect_review(
     if parsed_review_date and cutoff_date and parsed_review_date > cutoff_date:
         return False, False, "after_cutoff"
     if source_review_id in existing_source_review_ids:
-        return False, True, "existing_id"
+        return True, False, "existing_id"
     if parsed_review_date and newest_review_date and parsed_review_date < newest_review_date:
-        return False, True, "older_than_newest"
+        return True, False, "older_than_newest"
     return True, False, None
+
+
+def review_page_numbers() -> range | itertools.count:
+    if MAX_REVIEW_PAGES_PER_HOTEL is None:
+        return itertools.count()
+    return range(MAX_REVIEW_PAGES_PER_HOTEL)
 
 
 def is_review_graphql_request(request: Request) -> bool:
@@ -539,9 +546,8 @@ async def scrape_reviews_for_hotel(
     reviews: list[dict[str, Any]] = []
     seen_keys: set[str] = set()
     empty_pages = 0
-    no_new_pages = 0
 
-    for page_number in range(MAX_REVIEW_PAGES_PER_HOTEL):
+    for page_number in review_page_numbers():
         offset = page_number * REVIEWS_PER_PAGE
         page_body = json.loads(json.dumps(original_body))
         update_review_pagination(page_body, offset)
@@ -568,12 +574,11 @@ async def scrape_reviews_for_hotel(
         empty_pages = 0
         added = 0
         skipped = 0
-        existing_encountered = False
         for raw_review in raw_reviews:
             review = normalize_review(raw_review, hotel)
             key = review_seen_key(review)
             source_review_id = stable_review_id(review)
-            collect, should_stop, _reason = should_collect_review(
+            collect, _should_stop, _reason = should_collect_review(
                 review,
                 source_review_id,
                 existing_source_review_ids,
@@ -582,8 +587,6 @@ async def scrape_reviews_for_hotel(
             )
             if not collect:
                 skipped += 1
-                if should_stop:
-                    existing_encountered = True
                 continue
             if key not in seen_keys:
                 seen_keys.add(key)
@@ -594,11 +597,7 @@ async def scrape_reviews_for_hotel(
             f"  Reviews page {page_number + 1}: received {len(raw_reviews)}, "
             f"new {added}, skipped {skipped}, total {len(reviews)}"
         )
-        if existing_encountered:
-            print("  Existing review reached. Stopping newer-only review collection.")
-            break
-        no_new_pages = no_new_pages + 1 if added == 0 else 0
-        if no_new_pages >= 2 or len(raw_reviews) < REVIEWS_PER_PAGE:
+        if len(raw_reviews) < REVIEWS_PER_PAGE:
             break
         await page.wait_for_timeout(800)
     return reviews
@@ -714,7 +713,7 @@ async def scrape_reviewlist_fallback(
     seen_keys: set[str] = set()
     empty_pages = 0
 
-    for page_number in range(MAX_REVIEW_PAGES_PER_HOTEL):
+    for page_number in review_page_numbers():
         offset = page_number * REVIEWS_PER_PAGE
         result = await fetch_reviewlist_page(page, hotel, offset)
         if not result.get("ok"):
@@ -738,11 +737,10 @@ async def scrape_reviewlist_fallback(
 
         added = 0
         skipped = 0
-        existing_encountered = False
         for review in page_reviews:
             key = review_seen_key(review)
             source_review_id = stable_review_id(review)
-            collect, should_stop, _reason = should_collect_review(
+            collect, _should_stop, _reason = should_collect_review(
                 review,
                 source_review_id,
                 existing_source_review_ids,
@@ -751,8 +749,6 @@ async def scrape_reviewlist_fallback(
             )
             if not collect:
                 skipped += 1
-                if should_stop:
-                    existing_encountered = True
                 continue
             if key not in seen_keys:
                 seen_keys.add(key)
@@ -763,9 +759,6 @@ async def scrape_reviewlist_fallback(
             f"  Reviewlist page {page_number + 1}: received {len(page_reviews)}, "
             f"new {added}, skipped {skipped}, total {len(reviews)}"
         )
-        if existing_encountered:
-            print("  Existing review reached. Stopping newer-only review collection.")
-            break
         if not page_reviews:
             empty_pages += 1
             if empty_pages >= 2:
