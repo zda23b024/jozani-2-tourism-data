@@ -434,12 +434,14 @@ def create_database_tables(connection: Any) -> None:
                 verified_stay BOOLEAN,
                 helpful_votes INTEGER NOT NULL DEFAULT 0,
                 language_code VARCHAR(20),
+                raw_json JSONB,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 UNIQUE (place_source_id, source_review_id)
             )
             """
         )
+        cursor.execute("ALTER TABLE reviews ADD COLUMN IF NOT EXISTS raw_json JSONB")
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS review_category_scores (
@@ -462,12 +464,14 @@ def create_database_tables(connection: Any) -> None:
                 responder_role VARCHAR(100),
                 response_text TEXT NOT NULL,
                 response_date DATE,
+                raw_json JSONB,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 UNIQUE NULLS NOT DISTINCT (review_id, source_response_id)
             )
             """
         )
+        cursor.execute("ALTER TABLE review_responses ADD COLUMN IF NOT EXISTS raw_json JSONB")
         cursor.execute(
             """
             CREATE TABLE IF NOT EXISTS availability_offers (
@@ -942,13 +946,29 @@ def save_to_postgres(tables: dict[str, list[dict]]) -> None:
                         place_source_id, reviewer_id, source_review_id, review_title,
                         review_text, positive_text, negative_text, review_score,
                         country_code, room_name, visit_date, review_date,
-                        verified_stay, helpful_votes, language_code, created_at, updated_at
+                        verified_stay, helpful_votes, language_code, raw_json,
+                        created_at, updated_at
                     )
                     VALUES (
                         %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                        %s, COALESCE(%s, 0), %s, COALESCE(%s, NOW()), COALESCE(%s, NOW())
+                        %s, COALESCE(%s, 0), %s, %s::jsonb,
+                        COALESCE(%s, NOW()), COALESCE(%s, NOW())
                     )
-                    ON CONFLICT (place_source_id, source_review_id) DO NOTHING
+                    ON CONFLICT (place_source_id, source_review_id) DO UPDATE SET
+                        reviewer_id = COALESCE(EXCLUDED.reviewer_id, reviews.reviewer_id),
+                        review_title = COALESCE(EXCLUDED.review_title, reviews.review_title),
+                        review_text = COALESCE(EXCLUDED.review_text, reviews.review_text),
+                        positive_text = COALESCE(EXCLUDED.positive_text, reviews.positive_text),
+                        negative_text = COALESCE(EXCLUDED.negative_text, reviews.negative_text),
+                        review_score = COALESCE(EXCLUDED.review_score, reviews.review_score),
+                        room_name = COALESCE(EXCLUDED.room_name, reviews.room_name),
+                        visit_date = COALESCE(EXCLUDED.visit_date, reviews.visit_date),
+                        review_date = COALESCE(EXCLUDED.review_date, reviews.review_date),
+                        verified_stay = COALESCE(EXCLUDED.verified_stay, reviews.verified_stay),
+                        helpful_votes = COALESCE(EXCLUDED.helpful_votes, reviews.helpful_votes),
+                        language_code = COALESCE(EXCLUDED.language_code, reviews.language_code),
+                        raw_json = COALESCE(EXCLUDED.raw_json, reviews.raw_json),
+                        updated_at = NOW()
                     RETURNING review_id
                     """,
                     (
@@ -967,6 +987,7 @@ def save_to_postgres(tables: dict[str, list[dict]]) -> None:
                         row.get("verified_stay"),
                         int_value(row.get("helpful_votes")),
                         row.get("language"),
+                        db_value(row.get("raw_json")) or "{}",
                         row.get("created_at"),
                         row.get("updated_at"),
                     ),
@@ -995,14 +1016,15 @@ def save_to_postgres(tables: dict[str, list[dict]]) -> None:
                     """
                     INSERT INTO review_responses (
                         review_id, source_response_id, responder_name, responder_role,
-                        response_text, response_date, created_at, updated_at
+                        response_text, response_date, raw_json, created_at, updated_at
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, COALESCE(%s, NOW()), COALESCE(%s, NOW()))
+                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, COALESCE(%s, NOW()), COALESCE(%s, NOW()))
                     ON CONFLICT (review_id, source_response_id) DO UPDATE SET
                         responder_name = EXCLUDED.responder_name,
                         responder_role = EXCLUDED.responder_role,
                         response_text = EXCLUDED.response_text,
                         response_date = EXCLUDED.response_date,
+                        raw_json = EXCLUDED.raw_json,
                         updated_at = NOW()
                     """,
                     (
@@ -1012,6 +1034,7 @@ def save_to_postgres(tables: dict[str, list[dict]]) -> None:
                         text_limit(row.get("responder_role"), 100),
                         row.get("response_text"),
                         date_value(row.get("response_date")),
+                        db_value(row.get("raw_json")) or "{}",
                         row.get("created_at"),
                         row.get("updated_at"),
                     ),
@@ -1215,3 +1238,88 @@ def fetch_existing_review_ids_by_place_source_ids(
         f"{sum(len(values) for values in result.values())}"
     )
     return result
+
+
+def fetch_known_booking_places_for_reviews() -> tuple[list[dict], list[dict]]:
+    if psycopg is None:
+        print("Known place load skipped: psycopg is not installed.")
+        return [], []
+
+    url = database_url()
+    if not url:
+        print("Known place load skipped: database settings are missing.")
+        return [], []
+
+    ensure_database_exists()
+    hotels: list[dict] = []
+    attractions: list[dict] = []
+
+    try:
+        with psycopg.connect(url) as connection:
+            create_database_tables(connection)
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    """
+                    SELECT
+                        psr.source_place_id,
+                        psr.source_url,
+                        psr.source_name,
+                        psr.source_category,
+                        psr.raw_json,
+                        p.canonical_name,
+                        pt.type_group
+                    FROM place_source_records psr
+                    JOIN sources s ON s.source_id = psr.source_id
+                    JOIN places p ON p.place_id = psr.place_id
+                    JOIN place_types pt ON pt.place_type_id = p.place_type_id
+                    WHERE s.source_code = 'BOOKING'
+                      AND psr.source_url IS NOT NULL
+                      AND psr.is_active = TRUE
+                    ORDER BY pt.type_group, psr.source_name
+                    """
+                )
+                rows = cursor.fetchall()
+            connection.commit()
+    except Exception as error:
+        print("Known place load failed:", error)
+        return [], []
+
+    for row in rows:
+        (
+            source_place_id,
+            source_url,
+            source_name,
+            source_category,
+            raw_json,
+            canonical_name,
+            type_group,
+        ) = row
+        raw = raw_json if isinstance(raw_json, dict) else {}
+        if isinstance(raw_json, str):
+            try:
+                raw = json.loads(raw_json)
+            except json.JSONDecodeError:
+                raw = {}
+
+        place = {
+            **raw,
+            "name": raw.get("name") or source_name or canonical_name,
+            "property_url": raw.get("property_url") or source_url,
+        }
+
+        if type_group == "Accommodation":
+            place["hotel_id"] = raw.get("hotel_id") or str(source_place_id)
+            place["accommodation_type_id"] = raw.get("accommodation_type_id") or source_category
+            place["sold_out"] = False
+            hotels.append(place)
+            continue
+
+        if type_group in {"Attraction", "Activity"}:
+            place["attraction_id"] = raw.get("attraction_id") or str(source_place_id)
+            attractions.append(place)
+
+    print(
+        "Known Booking.com places loaded from PostgreSQL: "
+        f"{len(hotels)} hotels, {len(attractions)} attractions"
+    )
+    return hotels, attractions

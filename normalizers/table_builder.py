@@ -602,6 +602,7 @@ def normalize_reviews(reviews: list[dict], hotels: list[dict], now: str) -> list
                 "sentiment": None,
                 "emotion": None,
                 "spam_score": None,
+                "raw_json": review.get("raw_json"),
                 "created_at": now,
                 "updated_at": now,
             }
@@ -641,6 +642,7 @@ def normalize_review_responses(reviews: list[dict], hotels: list[dict], now: str
                 "responder_role": review.get("responder_role"),
                 "response_text": review.get("response_text"),
                 "response_date": review.get("response_date"),
+                "raw_json": review.get("response_raw_json"),
                 "created_at": now,
                 "updated_at": now,
             }
@@ -795,6 +797,8 @@ def build_all_tables(
     hotels: list[dict],
     reviews: list[dict],
     attractions: list[dict] | None = None,
+    include_availability: bool = True,
+    run_type: str = "booking_collection",
 ) -> dict[str, list[dict]]:
     attractions = attractions or []
     now = utc_now()
@@ -802,6 +806,7 @@ def build_all_tables(
     tables.update(build_master_rows(now))
 
     scraping_run = build_scraping_run(now, hotels, reviews, attractions)
+    scraping_run["run_type"] = run_type
     amenities, place_amenities = normalize_amenities_and_links(hotels, now)
     attraction_amenities, attraction_place_amenities = (
         normalize_attraction_amenities_and_links(attractions, now)
@@ -827,15 +832,16 @@ def build_all_tables(
     tables["reviews"] = normalize_reviews(reviews, hotels, now)
     tables["review_responses"] = normalize_review_responses(reviews, hotels, now)
     tables["scraping_runs"] = [scraping_run]
-    tables["availability_offers"] = normalize_availability_offers(
-        hotels,
-        scraping_run["scraping_run_id"],
-        now,
-    ) + normalize_attraction_availability_offers(
-        attractions,
-        scraping_run["scraping_run_id"],
-        now,
-    )
+    if include_availability:
+        tables["availability_offers"] = normalize_availability_offers(
+            hotels,
+            scraping_run["scraping_run_id"],
+            now,
+        ) + normalize_attraction_availability_offers(
+            attractions,
+            scraping_run["scraping_run_id"],
+            now,
+        )
     tables["place_policies"] = normalize_hotel_policies(
         hotels,
         now,

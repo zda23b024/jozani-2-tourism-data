@@ -12,8 +12,31 @@ OUTPUT_DIR = BASE_DIR / "output"
 CSV_DIR = OUTPUT_DIR / "csv"
 JSON_DIR = OUTPUT_DIR / "json"
 LOG_DIR = OUTPUT_DIR / "logs"
+DEBUG_DIR = OUTPUT_DIR / "debug"
+ATTRACTION_REVIEW_DEBUG_DIR = DEBUG_DIR / "attractions" / "reviews"
 
 SEARCH_TERM = "Zanzibar City"
+CATALOG_SEARCH_TERMS = [
+    "Zanzibar City",
+    "Stone Town",
+    "Nungwi",
+    "Kendwa",
+    "Paje",
+    "Bwejuu",
+    "Jambiani",
+    "Kiwengwa",
+    "Matemwe",
+    "Michamvi",
+    "Pingwe",
+    "Uroa",
+    "Kizimkazi",
+    "Makunduchi",
+    "Dongwe",
+    "Pwani Mchangani",
+    "Pongwe",
+    "Chwaka",
+    "Mangapwani",
+]
 SEARCH_COUNTRY = "Tanzania"
 SEARCH_REGION = "Zanzibar"
 SEARCH_ISLAND = "Unguja"
@@ -24,10 +47,11 @@ CHILDREN = 0
 
 ROWS_PER_PAGE = 25
 ATTRACTIONS_PER_PAGE = 15
-REVIEWS_PER_PAGE = 25
+REVIEWS_PER_PAGE = 50
 MAX_HOTEL_PAGES = 10
-MAX_ATTRACTION_PAGES = 6
-MAX_REVIEW_PAGES_PER_HOTEL = 10
+MAX_CATALOG_HOTEL_PAGES = 40
+MAX_ATTRACTION_PAGES = 10
+MAX_REVIEW_PAGES_PER_HOTEL = 15
 
 HEADLESS = False
 
@@ -52,13 +76,34 @@ SEARCH_URL = (
     "&order=class"
 )
 
+CATALOG_SEARCH_URL = (
+    "https://www.booking.com/searchresults.en-gb.html"
+    f"?ss={quote_plus(SEARCH_TERM)}"
+    f"&ssne={quote_plus(SEARCH_TERM)}"
+    f"&ssne_untouched={quote_plus(SEARCH_TERM)}"
+    "&order=class"
+)
+
 ATTRACTIONS_DEST_ID = "-2574828"
+CATALOG_ATTRACTION_DESTINATIONS = [
+    {
+        "name": "Zanzibar",
+        "dest_id": ATTRACTIONS_DEST_ID,
+    },
+]
 ATTRACTIONS_URL = (
     "https://www.booking.com/attractions/searchresults.en-gb.html"
     "?selected_currency=TZS"
     "&source=search_box"
     f"&start_date={CHECKIN}"
     f"&end_date={CHECKOUT}"
+    f"&dest_id={quote_plus(ATTRACTIONS_DEST_ID)}"
+)
+
+CATALOG_ATTRACTIONS_URL = (
+    "https://www.booking.com/attractions/searchresults.en-gb.html"
+    "?selected_currency=TZS"
+    "&source=search_box"
     f"&dest_id={quote_plus(ATTRACTIONS_DEST_ID)}"
 )
 
@@ -69,5 +114,6 @@ def ensure_project_dirs() -> None:
         CSV_DIR,
         JSON_DIR,
         LOG_DIR,
+        ATTRACTION_REVIEW_DEBUG_DIR,
     ]:
         path.mkdir(parents=True, exist_ok=True)

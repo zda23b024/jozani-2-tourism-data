@@ -1,7 +1,7 @@
 import html
 import json
 import re
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import quote_plus
 
@@ -138,9 +138,15 @@ def looks_like_review(item: dict[str, Any]) -> bool:
             "publisheddate",
             "createddate",
             "bubblerating",
+            "numericrating",
             "tripdate",
             "traveldate",
             "stayed",
+            "supplierresponse",
+            "providername",
+            "epochms",
+            "postedon",
+            "travelpartnertypes",
         ]
     )
 
@@ -181,24 +187,157 @@ def first_nested_value(
     return None
 
 
+def epoch_ms_to_iso(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    try:
+        numeric = int(float(value))
+    except (TypeError, ValueError):
+        return None
+    if numeric <= 0:
+        return None
+    return datetime.fromtimestamp(numeric / 1000, tz=timezone.utc).date().isoformat()
+
+
+def normalized_text(value: Any) -> str | None:
+    if value in (None, "", [], {}):
+        return None
+    if isinstance(value, str):
+        text = re.sub(r"\s+", " ", html.unescape(value)).strip()
+        return text or None
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        parts = [normalized_text(item) for item in value]
+        joined = " ".join(part for part in parts if part)
+        return joined or None
+    if not isinstance(value, dict):
+        return None
+
+    for key in [
+        "text",
+        "translation",
+        "value",
+        "message",
+        "body",
+        "comment",
+        "localizedText",
+        "displayText",
+        "plainText",
+    ]:
+        text = normalized_text(value.get(key))
+        if text:
+            return text
+    return None
+
+
+def first_review_text(
+    data: dict[str, Any],
+    paths: list[tuple[str, ...]],
+) -> str | None:
+    for path in paths:
+        text = normalized_text(nested_get(data, *path))
+        if text:
+            return text
+    return None
+
+
+def response_text_from_object(response: dict[str, Any]) -> str | None:
+    return first_review_text(
+        response,
+        [
+            ("text",),
+            ("responseText",),
+            ("replyText",),
+            ("reply",),
+            ("response",),
+            ("message",),
+            ("body",),
+            ("comment",),
+            ("content",),
+            ("textDetails", "text"),
+            ("translatedText",),
+            ("translatedText", "text"),
+        ],
+    )
+
+
+def response_has_responder_metadata(response: dict[str, Any]) -> bool:
+    metadata_keys = {
+        "respondername",
+        "managername",
+        "hotelname",
+        "propertyname",
+        "author",
+        "responderrole",
+        "role",
+        "date",
+        "responsedate",
+        "createddate",
+        "submitteddate",
+    }
+    return any(str(key).lower() in metadata_keys for key in response)
+
+
+def response_candidate(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, str):
+        text = normalized_text(value)
+        return {"text": text} if text else None
+    if isinstance(value, list):
+        for item in value:
+            candidate = response_candidate(item)
+            if candidate:
+                return candidate
+        return None
+    if not isinstance(value, dict):
+        return None
+    if response_text_from_object(value):
+        return value
+    return None
+
+
+def extract_review_response(raw_review: dict[str, Any]) -> dict[str, Any]:
+    direct_response_keys = [
+        "hotelResponse",
+        "hotelierResponse",
+        "propertyResponse",
+        "partnerReply",
+        "partnerResponse",
+        "supplierResponse",
+        "managementResponse",
+        "ownerResponse",
+        "ownerReply",
+        "hostResponse",
+        "hostReply",
+        "reply",
+        "replies",
+        "responses",
+    ]
+    for key in direct_response_keys:
+        candidate = response_candidate(raw_review.get(key))
+        if candidate:
+            return candidate
+
+    generic_response = response_candidate(raw_review.get("response"))
+    if generic_response and response_has_responder_metadata(generic_response):
+        return generic_response
+
+    for key, child in raw_review.items():
+        key_text = str(key).lower()
+        if not any(marker in key_text for marker in ["response", "reply"]):
+            continue
+        candidate = response_candidate(child)
+        if candidate:
+            return candidate
+
+    return {}
+
+
 def normalize_review(
     raw_review: dict[str, Any],
     hotel: dict[str, Any],
 ) -> dict[str, Any]:
-    response = first_nonempty(
-        first_nested_value(
-            raw_review,
-            [
-                ("hotelResponse",),
-                ("response",),
-                ("managementResponse",),
-                ("ownerResponse",),
-            ],
-        ),
-        {},
-    )
-    if not isinstance(response, dict):
-        response = {"text": response}
+    response = extract_review_response(raw_review)
 
     return {
         "review_id": first_nested_value(
@@ -223,41 +362,60 @@ def normalize_review(
                 ("guestDetails", "countryCode"),
                 ("reviewer", "country"),
                 ("user", "country"),
+                ("user", "cc1"),
             ],
         ),
         "review_score": first_nested_value(
             raw_review,
-            [("score",), ("reviewScore",), ("averageScore",), ("rating",)],
+            [("score",), ("reviewScore",), ("averageScore",), ("numericRating",), ("rating",)],
         ),
         "review_title": first_nested_text(
             raw_review,
-            [("title",), ("reviewTitle",), ("headline",)],
+            [("title",), ("reviewTitle",), ("headline",), ("titleText",)],
         ),
-        "positive_text": first_nested_text(
+        "positive_text": first_review_text(
             raw_review,
             [
                 ("positiveText",),
+                ("positiveText", "text"),
                 ("pros",),
                 ("likedText",),
                 ("textDetails", "positiveText"),
+                ("textDetails", "positiveText", "text"),
+                ("textDetails", "likedText"),
             ],
         ),
-        "negative_text": first_nested_text(
+        "negative_text": first_review_text(
             raw_review,
             [
                 ("negativeText",),
+                ("negativeText", "text"),
                 ("cons",),
                 ("dislikedText",),
                 ("textDetails", "negativeText"),
+                ("textDetails", "negativeText", "text"),
+                ("textDetails", "dislikedText"),
             ],
         ),
-        "review_text": first_nested_text(
+        "review_text": first_review_text(
             raw_review,
-            [("text",), ("reviewText",), ("body",), ("comments",)],
+            [
+                ("reviewText",),
+                ("reviewText", "text"),
+                ("textDetails", "reviewText"),
+                ("textDetails", "reviewText", "text"),
+                ("content",),
+                ("text",),
+                ("comments",),
+                ("comment",),
+            ],
         ),
-        "review_date": first_nested_value(
-            raw_review,
-            [("date",), ("reviewDate",), ("createdDate",), ("submittedDate",)],
+        "review_date": first_nonempty(
+            epoch_ms_to_iso(raw_review.get("epochMs")),
+            first_nested_value(
+                raw_review,
+                [("postedOn",), ("date",), ("reviewDate",), ("createdDate",), ("submittedDate",)],
+            ),
         ),
         "stayed_date": first_nested_value(
             raw_review,
@@ -275,22 +433,21 @@ def normalize_review(
             response,
             [("responseId",), ("id",), ("sourceResponseId",)],
         ),
-        "response_text": first_nested_text(
-            response,
-            [("text",), ("responseText",), ("body",), ("message",)],
-        ),
+        "response_text": response_text_from_object(response),
         "response_date": first_nested_value(
             response,
-            [("date",), ("responseDate",), ("createdDate",), ("submittedDate",)],
+            [("postedAt",), ("date",), ("responseDate",), ("createdDate",), ("submittedDate",)],
         ),
         "responder_name": first_nested_text(
             response,
-            [("responderName",), ("managerName",), ("author", "name")],
+            [("responderName",), ("managerName",), ("providerUsername",), ("author", "name")],
         ),
         "responder_role": first_nested_text(
             response,
             [("responderRole",), ("role",), ("author", "role")],
         ),
+        "raw_json": raw_review,
+        "response_raw_json": response or None,
     }
 
 

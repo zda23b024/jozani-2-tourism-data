@@ -1,17 +1,18 @@
 import asyncio
 import re
 from copy import deepcopy
-from datetime import date
 from typing import Any
-from urllib.parse import quote_plus
+from urllib.parse import parse_qsl, quote_plus, urlencode, urlsplit, urlunsplit
 
 from playwright.async_api import BrowserContext, Page, Request
 
 from config.configuration import (
     ADULTS,
+    CATALOG_SEARCH_TERMS,
     CHECKIN,
     CHECKOUT,
     CHILDREN,
+    MAX_CATALOG_HOTEL_PAGES,
     MAX_HOTEL_PAGES,
     ROOMS,
     ROWS_PER_PAGE,
@@ -33,8 +34,55 @@ from utils.helpers import (
     join_values,
     nested_get,
     normalize_image_url,
+    safe_filename,
     translation_text,
 )
+
+
+def hotel_dedupe_key(hotel: dict[str, Any]) -> str:
+    hotel_id = hotel.get("hotel_id")
+    if hotel_id is not None:
+        return f"id:{hotel_id}"
+    return (
+        f"name:{hotel.get('name')}|"
+        f"lat:{hotel.get('latitude')}|"
+        f"lon:{hotel.get('longitude')}"
+    )
+
+
+def stays_search_url(search_term: str, catalog_mode: bool) -> str:
+    if catalog_mode:
+        return (
+            "https://www.booking.com/searchresults.en-gb.html"
+            f"?ss={quote_plus(search_term)}"
+            f"&ssne={quote_plus(search_term)}"
+            f"&ssne_untouched={quote_plus(search_term)}"
+            "&order=class"
+        )
+    return SEARCH_URL
+
+
+def raw_query_for_session(search_term: str, catalog_mode: bool) -> str:
+    if catalog_mode:
+        return (
+            "/searchresults.en-gb.html"
+            f"?ss={quote_plus(search_term)}"
+            f"&ssne={quote_plus(search_term)}"
+            f"&ssne_untouched={quote_plus(search_term)}"
+            "&order=class"
+        )
+    return (
+        "/searchresults.en-gb.html"
+        f"?ss={quote_plus(search_term)}"
+        f"&ssne={quote_plus(search_term)}"
+        f"&ssne_untouched={quote_plus(search_term)}"
+        f"&checkin={CHECKIN}"
+        f"&checkout={CHECKOUT}"
+        f"&group_adults={ADULTS}"
+        f"&no_rooms={ROOMS}"
+        f"&group_children={CHILDREN}"
+        "&order=class"
+    )
 
 
 def extract_photo_url(item: dict[str, Any]) -> str | None:
@@ -97,10 +145,35 @@ def extract_price(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def strip_availability_query_params(url: str) -> str:
+    blocked_params = {
+        "checkin",
+        "checkout",
+        "group_adults",
+        "group_children",
+        "no_rooms",
+        "req_adults",
+        "req_children",
+        "req_rooms",
+        "selected_currency",
+    }
+    parts = urlsplit(url)
+    query = urlencode(
+        [
+            (key, value)
+            for key, value in parse_qsl(parts.query, keep_blank_values=True)
+            if key.lower() not in blocked_params
+        ],
+        doseq=True,
+    )
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
+
+
 def property_url_from_item(
     item: dict[str, Any],
     page_name: Any,
     country_code: Any,
+    include_search_dates: bool = True,
 ) -> str | None:
     property_url = find_property_url(item)
     if not property_url and page_name:
@@ -116,6 +189,8 @@ def property_url_from_item(
             property_url = f"https://www.booking.com/hotel/{page_path}.en-gb.html"
     if not property_url:
         return None
+    if not include_search_dates:
+        return strip_availability_query_params(property_url)
     separator = "&" if "?" in property_url else "?"
     return (
         f"{property_url}{separator}checkin={CHECKIN}"
@@ -126,7 +201,10 @@ def property_url_from_item(
     )
 
 
-def extract_hotel(item: dict[str, Any]) -> dict[str, Any]:
+def extract_hotel(
+    item: dict[str, Any],
+    include_search_dates: bool = True,
+) -> dict[str, Any]:
     basic = item.get("basicPropertyData") or {}
     basic_location = basic.get("location") or {}
     displayed_location = item.get("location") or {}
@@ -147,7 +225,12 @@ def extract_hotel(item: dict[str, Any]) -> dict[str, Any]:
             item.get("generatedPropertyTitle"),
         ),
         "accommodation_type_id": basic.get("accommodationTypeId"),
-        "property_url": property_url_from_item(item, page_name, country_code),
+        "property_url": property_url_from_item(
+            item,
+            page_name,
+            country_code,
+            include_search_dates=include_search_dates,
+        ),
         "page_name": page_name,
         "address": basic_location.get("address"),
         "city": basic_location.get("city"),
@@ -190,11 +273,18 @@ def extract_hotel(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def extract_results(payload: dict[str, Any]) -> list[dict[str, Any]]:
+def extract_results(
+    payload: dict[str, Any],
+    include_search_dates: bool = True,
+) -> list[dict[str, Any]]:
     results = nested_get(payload, "data", "searchQueries", "search", "results")
     if not isinstance(results, list):
         return []
-    return [extract_hotel(item) for item in results if isinstance(item, dict)]
+    return [
+        extract_hotel(item, include_search_dates=include_search_dates)
+        for item in results
+        if isinstance(item, dict)
+    ]
 
 
 def extract_total_results(payload: dict[str, Any]) -> int | None:
@@ -210,6 +300,46 @@ def extract_total_results(payload: dict[str, Any]) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def remove_catalog_availability_filters(value: Any) -> None:
+    availability_keys = {
+        "checkin",
+        "checkout",
+        "checkindate",
+        "checkoutdate",
+        "checkin_date",
+        "checkout_date",
+        "startdate",
+        "enddate",
+        "start_date",
+        "end_date",
+        "arrivaldate",
+        "departuredate",
+        "arrival_date",
+        "departure_date",
+        "adults",
+        "children",
+        "rooms",
+        "group_adults",
+        "group_children",
+        "no_rooms",
+        "nbadults",
+        "nbchildren",
+        "nbrooms",
+        "numberofadults",
+        "numberofchildren",
+        "numberofrooms",
+    }
+    if isinstance(value, dict):
+        for key in list(value.keys()):
+            if str(key).lower() in availability_keys:
+                value.pop(key, None)
+                continue
+            remove_catalog_availability_filters(value[key])
+    elif isinstance(value, list):
+        for child in value:
+            remove_catalog_availability_filters(child)
 
 
 def is_search_graphql_request(request: Request) -> bool:
@@ -231,7 +361,10 @@ def is_search_graphql_request(request: Request) -> bool:
     )
 
 
-async def wait_for_initial_request(page: Page) -> Request | None:
+async def wait_for_initial_request(
+    page: Page,
+    search_url: str,
+) -> Request | None:
     captured_request = None
     request_found = asyncio.Event()
 
@@ -243,53 +376,59 @@ async def wait_for_initial_request(page: Page) -> Request | None:
             print("Captured the browser-generated search API request.")
 
     page.on("request", request_handler)
-    await page.goto(SEARCH_URL, wait_until="domcontentloaded", timeout=120_000)
-    await accept_cookies(page)
+    try:
+        await page.goto(search_url, wait_until="domcontentloaded", timeout=120_000)
+        await accept_cookies(page)
 
-    print()
-    print("A browser window has opened.")
-    print("Complete any normal verification shown by Booking.com.")
-    print("Wait until the search results appear.")
-    print()
+        print()
+        print("A browser window has opened.")
+        print("Complete any normal verification shown by Booking.com.")
+        print("Wait until the search results appear.")
+        print()
 
-    for attempt in range(3):
-        if request_found.is_set():
-            break
-        try:
-            await page.wait_for_timeout(5000)
-            await page.evaluate(
-                'window.scrollTo({top: document.body.scrollHeight, behavior: "smooth"})'
-            )
-            await page.wait_for_timeout(3000)
-            button = page.locator(
-                '[data-testid="searchbox-submit-button"], '
-                'button[type="submit"]:has-text("Search"), '
-                'button:has-text("Search")'
-            ).first
-            if await button.is_visible(timeout=1500):
-                print("Clicking Search to trigger the API request.")
-                await button.click()
-                await page.wait_for_timeout(5000)
+        for attempt in range(3):
             if request_found.is_set():
                 break
-            print(
-                f"Still waiting for a search API request after browser nudge {attempt + 1}/3..."
-            )
-        except Exception:
-            continue
+            try:
+                await page.wait_for_timeout(5000)
+                await page.evaluate(
+                    'window.scrollTo({top: document.body.scrollHeight, behavior: "smooth"})'
+                )
+                await page.wait_for_timeout(3000)
+                button = page.locator(
+                    '[data-testid="searchbox-submit-button"], '
+                    'button[type="submit"]:has-text("Search"), '
+                    'button:has-text("Search")'
+                ).first
+                if await button.is_visible(timeout=1500):
+                    print("Clicking Search to trigger the API request.")
+                    await button.click()
+                    await page.wait_for_timeout(5000)
+                if request_found.is_set():
+                    break
+                print(
+                    f"Still waiting for a search API request after browser nudge {attempt + 1}/3..."
+                )
+            except Exception:
+                continue
 
-    try:
-        print(
-            "Final wait for search API request: "
-            f"{SEARCH_API_CAPTURE_TIMEOUT_SECONDS} seconds..."
-        )
-        await asyncio.wait_for(
-            request_found.wait(),
-            timeout=SEARCH_API_CAPTURE_TIMEOUT_SECONDS,
-        )
-    except asyncio.TimeoutError:
-        pass
-    return captured_request
+        try:
+            print(
+                "Final wait for search API request: "
+                f"{SEARCH_API_CAPTURE_TIMEOUT_SECONDS} seconds..."
+            )
+            await asyncio.wait_for(
+                request_found.wait(),
+                timeout=SEARCH_API_CAPTURE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            pass
+        return captured_request
+    finally:
+        try:
+            page.remove_listener("request", request_handler)
+        except Exception:
+            pass
 
 
 def clean_text(value: Any) -> str | None:
@@ -424,106 +563,134 @@ async def enrich_hotels_with_detail_pages(
 
 async def scrape_hotels_in_context(
     context: BrowserContext,
+    catalog_mode: bool = False,
 ) -> list[dict[str, Any]]:
     page = context.pages[0] if context.pages else await context.new_page()
-    print(f"Search location: {SEARCH_TERM}")
-    print(f"Check-in date: {CHECKIN}")
-    print(f"Check-out date: {CHECKOUT}")
-    print("Date mode: automatic current-day scrape")
-    print(f"Search URL: {SEARCH_URL}")
-    print()
-
-    captured_request = await wait_for_initial_request(page)
-    if captured_request is None:
-        print("No search API request was captured.")
-        return []
-
-    original_body = parse_request_body(captured_request)
-    if not isinstance(original_body, dict):
-        print("Could not parse the captured request body.")
-        return []
-
-    endpoint_url = captured_request.url
-    headers = await build_fetch_headers(captured_request)
-    template_body = deepcopy(original_body)
-    input_data = template_body.setdefault("variables", {}).setdefault("input", {})
-    input_data["doAvailabilityCheck"] = True
-    input_data.setdefault("location", {})["searchString"] = SEARCH_TERM
-    input_data["filters"] = {}
-    input_data.setdefault("pagination", {})["rowsPerPage"] = ROWS_PER_PAGE
-    input_data["pagination"]["offset"] = 0
-    input_data["rawQueryForSession"] = (
-        "/searchresults.en-gb.html"
-        f"?ss={quote_plus(SEARCH_TERM)}"
-        f"&ssne={quote_plus(SEARCH_TERM)}"
-        f"&ssne_untouched={quote_plus(SEARCH_TERM)}"
-        f"&checkin={CHECKIN}"
-        f"&checkout={CHECKOUT}"
-        f"&group_adults={ADULTS}"
-        f"&no_rooms={ROOMS}"
-        f"&group_children={CHILDREN}"
-        "&order=class"
-    )
-
+    max_pages = MAX_CATALOG_HOTEL_PAGES if catalog_mode else MAX_HOTEL_PAGES
     all_hotels: dict[str, dict[str, Any]] = {}
-    reported_total = None
-    print("Starting API pagination...")
-    print()
 
-    for page_number in range(MAX_HOTEL_PAGES):
-        offset = page_number * ROWS_PER_PAGE
-        page_body = deepcopy(template_body)
-        page_input = page_body["variables"]["input"]
-        page_input["pagination"]["offset"] = offset
-        page_input["pagination"]["rowsPerPage"] = ROWS_PER_PAGE
-        page_input["clientSideRequestId"] = f"playwright-{page_number}-{offset}"
+    async def scrape_search_term(search_term: str) -> None:
+        search_url = stays_search_url(search_term, catalog_mode)
+        print(f"Search location: {search_term}")
+        if catalog_mode:
+            print("Date mode: catalog discovery, no availability date filter")
+        else:
+            print(f"Check-in date: {CHECKIN}")
+            print(f"Check-out date: {CHECKOUT}")
+            print("Date mode: automatic current-day scrape")
+        print(f"Search URL: {search_url}")
+        print()
 
-        try:
-            payload = await fetch_graphql_page(
-                page=page,
-                endpoint_url=endpoint_url,
-                headers=headers,
-                body=page_body,
-            )
-        except Exception as error:
-            print(f"Page {page_number + 1} failed: {error}")
-            break
+        captured_request = await wait_for_initial_request(page, search_url)
+        if captured_request is None:
+            print("No search API request was captured.")
+            return
 
-        if reported_total is None:
-            reported_total = extract_total_results(payload)
-            if reported_total is not None:
-                print("API-reported total results:", reported_total)
+        original_body = parse_request_body(captured_request)
+        if not isinstance(original_body, dict):
+            print("Could not parse the captured request body.")
+            return
 
-        page_hotels = extract_results(payload)
-        if not page_hotels:
-            print(f"Offset {offset}: no results returned. Pagination finished.")
-            break
-
-        added = 0
-        for hotel in page_hotels:
-            hotel_id = hotel.get("hotel_id")
-            key = (
-                f"id:{hotel_id}"
-                if hotel_id is not None
-                else f"name:{hotel.get('name')}|lat:{hotel.get('latitude')}|lon:{hotel.get('longitude')}"
-            )
-            if key not in all_hotels:
-                all_hotels[key] = hotel
-                added += 1
-
-        print(
-            f"Page {page_number + 1:>3} | offset {offset:>5} | "
-            f"received {len(page_hotels):>2} | new {added:>2} | "
-            f"total unique {len(all_hotels)}"
+        endpoint_url = captured_request.url
+        headers = await build_fetch_headers(captured_request)
+        template_body = deepcopy(original_body)
+        input_data = template_body.setdefault("variables", {}).setdefault("input", {})
+        input_data["doAvailabilityCheck"] = not catalog_mode
+        input_data.setdefault("location", {})["searchString"] = search_term
+        input_data["filters"] = {}
+        if catalog_mode:
+            remove_catalog_availability_filters(input_data)
+        input_data.setdefault("pagination", {})["rowsPerPage"] = ROWS_PER_PAGE
+        input_data["pagination"]["offset"] = 0
+        input_data["rawQueryForSession"] = raw_query_for_session(
+            search_term,
+            catalog_mode,
         )
 
-        if reported_total is not None and offset + len(page_hotels) >= reported_total:
-            print("Reached the API-reported total.")
-            break
-        if len(page_hotels) < ROWS_PER_PAGE:
-            print(f"The last page contained fewer than {ROWS_PER_PAGE} properties.")
-            break
-        await page.wait_for_timeout(1200)
+        reported_total = None
+        term_start_count = len(all_hotels)
+        print("Starting API pagination...")
+        print()
+
+        for page_number in range(max_pages):
+            offset = page_number * ROWS_PER_PAGE
+            page_body = deepcopy(template_body)
+            page_input = page_body["variables"]["input"]
+            page_input["pagination"]["offset"] = offset
+            page_input["pagination"]["rowsPerPage"] = ROWS_PER_PAGE
+            page_input["clientSideRequestId"] = f"playwright-{safe_filename(search_term)}-{page_number}-{offset}"
+
+            try:
+                payload = await fetch_graphql_page(
+                    page=page,
+                    endpoint_url=endpoint_url,
+                    headers=headers,
+                    body=page_body,
+                )
+            except Exception as error:
+                print(f"Page {page_number + 1} failed: {error}")
+                break
+
+            if reported_total is None:
+                reported_total = extract_total_results(payload)
+                if reported_total is not None:
+                    print("API-reported total results:", reported_total)
+
+            page_hotels = extract_results(
+                payload,
+                include_search_dates=not catalog_mode,
+            )
+            if not page_hotels:
+                print(f"Offset {offset}: no results returned. Pagination finished.")
+                break
+
+            added = 0
+            for hotel in page_hotels:
+                key = hotel_dedupe_key(hotel)
+                if key not in all_hotels:
+                    all_hotels[key] = {
+                        **hotel,
+                        "catalog_search_term": search_term,
+                    }
+                    added += 1
+
+            print(
+                f"Page {page_number + 1:>3} | offset {offset:>5} | "
+                f"received {len(page_hotels):>2} | new {added:>2} | "
+                f"total unique {len(all_hotels)}"
+            )
+
+            if reported_total is not None and offset + len(page_hotels) >= reported_total:
+                print("Reached the API-reported total.")
+                break
+            if len(page_hotels) < ROWS_PER_PAGE:
+                print(f"The last page contained fewer than {ROWS_PER_PAGE} properties.")
+                break
+            await page.wait_for_timeout(1200)
+
+        print(
+            f"Finished {search_term}: "
+            f"{len(all_hotels) - term_start_count} new unique properties."
+        )
+        print()
+
+    search_terms = CATALOG_SEARCH_TERMS if catalog_mode else [SEARCH_TERM]
+    if catalog_mode:
+        print()
+        print("=" * 60)
+        print("COLLECTING ZANZIBAR-WIDE HOTEL CATALOG")
+        print("=" * 60)
+        print(f"Catalog search terms: {len(search_terms)}")
+        print()
+
+    for index, search_term in enumerate(search_terms, start=1):
+        if catalog_mode:
+            print("-" * 60)
+            print(f"Catalog area {index}/{len(search_terms)}")
+            print("-" * 60)
+        await scrape_search_term(search_term)
+
+    print(f"Total unique hotels collected before detail enrichment: {len(all_hotels)}")
 
     return await enrich_hotels_with_detail_pages(
         context,

@@ -20,6 +20,8 @@ browser/*_browser_profile/
 # Generated output
 output/csv/*
 output/json/*
+output/debug/
+output/logs/
 !output/csv/.gitkeep
 !output/json/.gitkeep
 
@@ -36,4 +38,5 @@ tmp/
 .DS_Store
 Thumbs.db
 .vscode/
+vscode_backup/
 .idea/

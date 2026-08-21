@@ -94,6 +94,64 @@ For Booking.com attractions, `ATTRACTIONS_DEST_ID` must match the destination.
 python main.py
 ```
 
+Default daily run:
+
+```powershell
+python main.py
+```
+
+This collects today's date-based prices and availability, plus new reviews.
+
+Full base dataset run:
+
+```powershell
+python main.py --all
+```
+
+This collects the hotel and attraction catalog plus reviews, without saving date-based availability offers.
+Hotel discovery uses undated Booking.com catalog searches across configured Zanzibar areas, then deduplicates by Booking.com hotel ID. Attraction discovery uses undated Booking.com attraction destination IDs from `CATALOG_ATTRACTION_DESTINATIONS`, then deduplicates by Booking.com attraction ID.
+
+The default Zanzibar hotel catalog areas are:
+
+```text
+Zanzibar City, Stone Town, Nungwi, Kendwa, Paje, Bwejuu,
+Jambiani, Kiwengwa, Matemwe, Michamvi, Pingwe, Uroa,
+Kizimkazi, Makunduchi, Dongwe, Pwani Mchangani, Pongwe,
+Chwaka, Mangapwani
+```
+
+The default attraction catalog destination is:
+
+```text
+Zanzibar: -2574828
+```
+
+Add more Booking.com attraction destination IDs to `CATALOG_ATTRACTION_DESTINATIONS` in `config/configuration.py` when they are discovered.
+
+Review-only run:
+
+```powershell
+python main.py --reviews
+```
+
+This loads known Booking.com hotels and attractions from PostgreSQL and collects only new reviews.
+
+Catalog-only refresh:
+
+```powershell
+python main.py --catalog
+```
+
+This refreshes stable hotel and attraction details without reviews or date-based availability offers.
+Hotel and attraction discovery use the same undated catalog searches as `--all`.
+
+Optional limiter:
+
+```powershell
+python main.py --daily --only hotels
+python main.py --daily --only attractions
+```
+
 Each run saves:
 
 - CSV output under `output/csv`

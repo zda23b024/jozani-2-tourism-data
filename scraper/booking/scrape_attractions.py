@@ -8,6 +8,8 @@ from urllib.parse import quote_plus
 from playwright.async_api import BrowserContext, Page, Request
 
 from config.configuration import (
+    CATALOG_ATTRACTION_DESTINATIONS,
+    ATTRACTION_REVIEW_DEBUG_DIR,
     ATTRACTIONS_DEST_ID,
     ATTRACTIONS_PER_PAGE,
     ATTRACTIONS_URL,
@@ -36,9 +38,7 @@ from scraper.booking.scrape_reviews import (
     find_review_items,
     normalize_review,
     review_cutoff_date,
-    review_seen_key,
     should_collect_review,
-    update_review_pagination,
 )
 
 
@@ -75,6 +75,45 @@ def is_attraction_review_request(request: Request) -> bool:
     )
 
 
+def remove_catalog_attraction_date_filters(value: Any) -> None:
+    date_keys = {
+        "filterbystartdate",
+        "filterbyenddate",
+        "startdate",
+        "enddate",
+        "start_date",
+        "end_date",
+        "date",
+    }
+    if isinstance(value, dict):
+        for key in list(value.keys()):
+            if str(key).lower() in date_keys:
+                value.pop(key, None)
+                continue
+            remove_catalog_attraction_date_filters(value[key])
+    elif isinstance(value, list):
+        for child in value:
+            remove_catalog_attraction_date_filters(child)
+
+
+def attraction_search_url(dest_id: str, catalog_mode: bool) -> str:
+    if catalog_mode:
+        return (
+            "https://www.booking.com/attractions/searchresults.en-gb.html"
+            "?selected_currency=TZS"
+            "&source=search_box"
+            f"&dest_id={quote_plus(dest_id)}"
+        )
+    return ATTRACTIONS_URL
+
+
+def attraction_dedupe_key(attraction: dict[str, Any]) -> str:
+    attraction_id = attraction.get("attraction_id")
+    if attraction_id not in (None, ""):
+        return f"id:{attraction_id}"
+    return str(attraction.get("name") or "").strip().lower()
+
+
 def attraction_source_place_id(attraction: dict[str, Any]) -> str:
     value = attraction.get("attraction_id")
     if value not in (None, ""):
@@ -101,7 +140,10 @@ def prepare_attraction_review(review: dict[str, Any], attraction: dict[str, Any]
     }
 
 
-async def wait_for_attraction_request(page: Page) -> Request | None:
+async def wait_for_attraction_request(
+    page: Page,
+    attractions_url: str,
+) -> Request | None:
     captured_request = None
     request_found = asyncio.Event()
 
@@ -113,7 +155,7 @@ async def wait_for_attraction_request(page: Page) -> Request | None:
             print("Captured the browser-generated attractions API request.")
 
     page.on("request", request_handler)
-    await page.goto(ATTRACTIONS_URL, wait_until="domcontentloaded", timeout=120_000)
+    await page.goto(attractions_url, wait_until="domcontentloaded", timeout=120_000)
     await accept_cookies(page)
 
     print()
@@ -262,6 +304,44 @@ def parse_price_amount(value: Any) -> float | None:
         return None
 
 
+def recursive_first_number(value: Any, key_names: set[str]) -> float | None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            key_text = str(key).lower()
+            if key_text in key_names:
+                parsed = parse_price_amount(child)
+                if parsed is not None:
+                    return parsed
+            parsed = recursive_first_number(child, key_names)
+            if parsed is not None:
+                return parsed
+    elif isinstance(value, list):
+        for child in value:
+            parsed = recursive_first_number(child, key_names)
+            if parsed is not None:
+                return parsed
+    return None
+
+
+def recursive_first_currency(value: Any) -> str | None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            key_text = str(key).lower()
+            if key_text in {"currency", "currencycode", "selectedcurrency"}:
+                text = str(child or "").strip().upper()
+                if text:
+                    return "USD" if text == "US$" else text[:3]
+            found = recursive_first_currency(child)
+            if found:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = recursive_first_currency(child)
+            if found:
+                return found
+    return None
+
+
 def parse_review_count(value: Any) -> int | None:
     if value in (None, ""):
         return None
@@ -400,7 +480,7 @@ async def scrape_attraction_detail_page(
     detail_photos = list(dict.fromkeys([*existing_photos, *images]))
 
     price_match = re.search(
-        r"(TZS|USD|US\$|EUR|GBP)\s*([\d,.]+)",
+        r"(?:From\s+)?(TZS|USD|US\$|EUR|GBP)\s*([\d,.]+)",
         body_text,
         flags=re.IGNORECASE,
     )
@@ -705,6 +785,124 @@ async def scrape_visible_attraction_review_cards(
     return reviews
 
 
+async def scrape_visible_attraction_review_cards(
+    page: Page,
+    attraction: dict[str, Any],
+    existing_source_review_ids: set[str],
+) -> list[dict[str, Any]]:
+    reviews: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    seen_content_keys: set[str] = set()
+
+    async def add_current_cards() -> int:
+        visible_reviews = await visible_attraction_review_list_from_page(page, attraction)
+        if not visible_reviews:
+            single_review = await visible_attraction_review_from_page(page, attraction)
+            visible_reviews = [single_review] if single_review else []
+
+        added = 0
+        for review in visible_reviews:
+            source_review_id = stable_review_id(review)
+            content_key = attraction_review_content_key(review)
+            if (
+                source_review_id in existing_source_review_ids
+                or source_review_id in seen_ids
+                or content_key in seen_content_keys
+            ):
+                continue
+            seen_ids.add(source_review_id)
+            seen_content_keys.add(content_key)
+            reviews.append(review)
+            added += 1
+        return added
+
+    await add_current_cards()
+
+    next_selectors = [
+        'button[aria-label="Next"]',
+        'button[aria-label*="next" i]',
+        '[role="button"][aria-label="Next"]',
+        '[role="button"][aria-label*="next" i]',
+        'button:has-text("›")',
+        'button:has-text(">")',
+        'button:has-text("Next")',
+        'a[aria-label*="next" i]',
+    ]
+    stale_clicks = 0
+
+    for click_index in range(60):
+        clicked = False
+        before_count = len(reviews)
+        before_keys = set(seen_content_keys)
+
+        for selector in next_selectors:
+            try:
+                target = page.locator(selector).last
+                if not await target.is_visible(timeout=700):
+                    continue
+                if not await target.is_enabled(timeout=700):
+                    continue
+                disabled = await target.evaluate(
+                    """
+                    (node) => Boolean(
+                        node.disabled ||
+                        node.getAttribute('aria-disabled') === 'true' ||
+                        node.closest('[aria-disabled="true"]')
+                    )
+                    """
+                )
+                if disabled:
+                    continue
+                await target.click()
+                await page.wait_for_timeout(1200)
+                clicked = True
+                break
+            except Exception:
+                continue
+
+        if not clicked:
+            try:
+                await page.evaluate(
+                    """
+                    () => {
+                        const dialog = document.querySelector('[role="dialog"], [aria-modal="true"]');
+                        const target = dialog || document.scrollingElement || document.documentElement;
+                        target.scrollBy({top: 700, behavior: 'smooth'});
+                    }
+                    """
+                )
+                await page.wait_for_timeout(900)
+                if await add_current_cards():
+                    stale_clicks = 0
+                    continue
+            except Exception:
+                pass
+            break
+
+        for _ in range(5):
+            added = await add_current_cards()
+            if added or seen_content_keys != before_keys:
+                break
+            await page.wait_for_timeout(500)
+
+        if len(reviews) == before_count:
+            stale_clicks += 1
+        else:
+            stale_clicks = 0
+
+        if stale_clicks >= 4:
+            print(
+                "  Visible review carousel stopped after "
+                f"{click_index + 1} clicks with no new reviews."
+            )
+            break
+
+    print(f"  Visible attraction reviews collected: {len(reviews)}")
+    if not reviews:
+        await save_attraction_review_debug(page, attraction)
+    return reviews
+
+
 def photo_url(photo: Any) -> str | None:
     if isinstance(photo, str):
         return photo
@@ -752,15 +950,45 @@ def extract_price(product: dict[str, Any]) -> dict[str, Any]:
     price = first_nonempty(
         product.get("representativePrice"),
         product.get("offersRepresentativePrice"),
+        product.get("price"),
+        product.get("displayPrice"),
+        product.get("pricing"),
     )
     if not isinstance(price, dict):
-        return {"price": None, "currency": None}
+        parsed_text_price = parse_price_amount(price)
+        return {
+            "price": parsed_text_price,
+            "currency": recursive_first_currency(product),
+        }
     return {
         "price": first_nonempty(
             price.get("chargeAmount"),
             price.get("publicAmount"),
+            price.get("amount"),
+            price.get("value"),
+            price.get("finalAmount"),
+            price.get("grossAmount"),
+            price.get("displayAmount"),
+            nested_get(price, "amount", "value"),
+            recursive_first_number(
+                price,
+                {
+                    "chargeamount",
+                    "publicamount",
+                    "amount",
+                    "value",
+                    "finalamount",
+                    "grossamount",
+                    "displayamount",
+                },
+            ),
         ),
-        "currency": price.get("currency"),
+        "currency": first_nonempty(
+            price.get("currency"),
+            price.get("currencyCode"),
+            recursive_first_currency(price),
+            recursive_first_currency(product),
+        ),
     }
 
 
@@ -978,83 +1206,236 @@ def has_next_page(payload: dict[str, Any]) -> bool:
     )
 
 
+def attraction_review_total(payload: dict[str, Any]) -> int | None:
+    value = nested_get(
+        payload,
+        "data",
+        "attractionsProduct",
+        "getReviewsV3",
+        "total",
+    )
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def attraction_review_content_key(review: dict[str, Any]) -> str:
+    return json.dumps(
+        [
+            review.get("reviewer_name"),
+            review.get("review_date"),
+            review.get("review_text"),
+            review.get("positive_text"),
+            review.get("negative_text"),
+        ],
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+
+
+def prepare_attraction_review_request_body(body: dict[str, Any], page_number: int) -> None:
+    input_data = nested_get(body, "variables", "input")
+    if not isinstance(input_data, dict):
+        return
+
+    page_size = REVIEWS_PER_PAGE
+    pagination = input_data.get("pagination")
+    if isinstance(pagination, dict):
+        try:
+            page_size = max(page_size, int(pagination.get("pageSize") or page_size))
+        except (TypeError, ValueError):
+            page_size = REVIEWS_PER_PAGE
+
+    filters = input_data.get("filterBy")
+    if isinstance(filters, list):
+        input_data["filterBy"] = [
+            item
+            for item in filters
+            if not (
+                isinstance(item, dict)
+                and str(item.get("filterType") or "").lower()
+                in {"score_range", "language"}
+            )
+        ]
+
+    input_data["pagination"] = {
+        "page": page_number,
+        "pageSize": page_size,
+    }
+    input_data["sortBy"] = "newest"
+    input_data.pop("offset", None)
+    input_data.pop("skip", None)
+    input_data.pop("page", None)
+    input_data.pop("limit", None)
+    input_data.pop("rowsPerPage", None)
+
+
+async def save_attraction_review_debug(page: Page, attraction: dict[str, Any]) -> None:
+    try:
+        data = await page.evaluate(
+            """
+            () => {
+                const text = (el) => (el?.innerText || el?.textContent || '').trim();
+                const buttons = Array.from(document.querySelectorAll('button, [role="button"], a'))
+                    .map((node) => ({
+                        text: text(node),
+                        aria: node.getAttribute('aria-label') || '',
+                        disabled: Boolean(node.disabled || node.getAttribute('aria-disabled') === 'true')
+                    }))
+                    .filter((item) => item.text || item.aria)
+                    .slice(0, 120);
+                const reviewish = Array.from(document.querySelectorAll('[data-testid*="review" i], [aria-label*="review" i], article, section'))
+                    .map((node) => text(node))
+                    .filter((value) => value && value.length > 20)
+                    .slice(0, 40);
+                return {
+                    url: location.href,
+                    title: document.title,
+                    body: (document.body?.innerText || '').slice(0, 8000),
+                    buttons,
+                    reviewish
+                };
+            }
+            """
+        )
+    except Exception as error:
+        data = {"error": str(error)}
+
+    source_place_id = attraction_source_place_id(attraction)
+    path = ATTRACTION_REVIEW_DEBUG_DIR / f"{safe_filename(source_place_id)}.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        f"name: {attraction.get('name')}",
+        f"attraction_id: {source_place_id}",
+        f"url: {getattr(page, 'url', '')}",
+        "",
+        json.dumps(data, indent=2, ensure_ascii=False),
+    ]
+    try:
+        path.write_text("\n".join(lines), encoding="utf-8")
+        print(f"  Attraction review debug saved: {path}")
+    except Exception as error:
+        print(f"  Attraction review debug save failed: {error}")
+
+
 async def scrape_attractions_in_context(
     context: BrowserContext,
+    catalog_mode: bool = False,
 ) -> list[dict[str, Any]]:
     page = await context.new_page()
+    all_attractions: dict[str, dict[str, Any]] = {}
     try:
         print()
         print("=" * 60)
         print("COLLECTING BOOKING.COM ATTRACTIONS")
         print("=" * 60)
-        print(f"Attractions URL: {ATTRACTIONS_URL}")
-        print(f"Start date: {CHECKIN}")
-        print(f"End date: {CHECKOUT}")
-        print(f"Destination ID: {ATTRACTIONS_DEST_ID}")
-        print()
 
-        captured_request = await wait_for_attraction_request(page)
-        if captured_request is None:
-            print("No attractions API request was captured.")
-            return []
+        destinations = (
+            CATALOG_ATTRACTION_DESTINATIONS
+            if catalog_mode
+            else [{"name": "Configured destination", "dest_id": ATTRACTIONS_DEST_ID}]
+        )
+        if catalog_mode:
+            print(f"Catalog attraction destinations: {len(destinations)}")
+            print()
 
-        original_body = parse_request_body(captured_request)
-        if not isinstance(original_body, dict):
-            print("Could not parse the captured attractions request body.")
-            return []
+        async def scrape_destination(destination: dict[str, str]) -> None:
+            destination_name = destination.get("name") or destination.get("dest_id") or "Unknown"
+            dest_id = str(destination.get("dest_id") or ATTRACTIONS_DEST_ID)
+            attractions_url = attraction_search_url(dest_id, catalog_mode)
 
-        endpoint_url = captured_request.url
-        headers = await build_fetch_headers(captured_request)
-        template_body = deepcopy(original_body)
-        input_data = template_body.setdefault("variables", {}).setdefault("input", {})
-        input_data["ufi"] = int(ATTRACTIONS_DEST_ID)
-        input_data["filterByStartDate"] = CHECKIN
-        input_data["filterByEndDate"] = CHECKOUT
-        input_data["limit"] = ATTRACTIONS_PER_PAGE
-        input_data["page"] = 1
-        input_data["source"] = "search_results"
-        template_body.setdefault("variables", {})["includeOffersRepresentativePrice"] = True
-        template_body.setdefault("variables", {})["includeAvailableDates"] = True
+            print("-" * 60)
+            print(f"Attraction destination: {destination_name}")
+            print("-" * 60)
+            print(f"Attractions URL: {attractions_url}")
+            if catalog_mode:
+                print("Date mode: catalog discovery, no attraction availability date filter")
+            else:
+                print(f"Start date: {CHECKIN}")
+                print(f"End date: {CHECKOUT}")
+            print(f"Destination ID: {dest_id}")
+            print()
 
-        all_attractions: dict[str, dict[str, Any]] = {}
+            captured_request = await wait_for_attraction_request(page, attractions_url)
+            if captured_request is None:
+                print("No attractions API request was captured.")
+                return
 
-        for page_number in range(1, MAX_ATTRACTION_PAGES + 1):
-            page_body = deepcopy(template_body)
-            page_body["variables"]["input"]["page"] = page_number
-            page_body["variables"]["input"]["limit"] = ATTRACTIONS_PER_PAGE
+            original_body = parse_request_body(captured_request)
+            if not isinstance(original_body, dict):
+                print("Could not parse the captured attractions request body.")
+                return
 
-            try:
-                payload = await fetch_graphql_page(
-                    page=page,
-                    endpoint_url=endpoint_url,
-                    headers=headers,
-                    body=page_body,
+            endpoint_url = captured_request.url
+            headers = await build_fetch_headers(captured_request)
+            template_body = deepcopy(original_body)
+            input_data = template_body.setdefault("variables", {}).setdefault("input", {})
+            input_data["ufi"] = int(dest_id)
+            if catalog_mode:
+                remove_catalog_attraction_date_filters(input_data)
+            else:
+                input_data["filterByStartDate"] = CHECKIN
+                input_data["filterByEndDate"] = CHECKOUT
+            input_data["limit"] = ATTRACTIONS_PER_PAGE
+            input_data["page"] = 1
+            input_data["source"] = "search_results"
+            variables = template_body.setdefault("variables", {})
+            variables["includeOffersRepresentativePrice"] = not catalog_mode
+            variables["includeAvailableDates"] = not catalog_mode
+
+            destination_start_count = len(all_attractions)
+
+            for page_number in range(1, MAX_ATTRACTION_PAGES + 1):
+                page_body = deepcopy(template_body)
+                page_body["variables"]["input"]["page"] = page_number
+                page_body["variables"]["input"]["limit"] = ATTRACTIONS_PER_PAGE
+
+                try:
+                    payload = await fetch_graphql_page(
+                        page=page,
+                        endpoint_url=endpoint_url,
+                        headers=headers,
+                        body=page_body,
+                    )
+                except Exception as error:
+                    print(f"Attractions page {page_number} failed: {error}")
+                    break
+
+                products = extract_products(payload)
+                if not products:
+                    print(f"Attractions page {page_number}: no products returned.")
+                    break
+
+                added = 0
+                for product in products:
+                    key = attraction_dedupe_key(product)
+                    if key and key not in all_attractions:
+                        all_attractions[key] = {
+                            **product,
+                            "catalog_destination_name": destination_name,
+                            "catalog_destination_id": dest_id,
+                        }
+                        added += 1
+
+                print(
+                    f"Attractions page {page_number:>3} | "
+                    f"received {len(products):>2} | new {added:>2} | "
+                    f"total unique {len(all_attractions)}"
                 )
-            except Exception as error:
-                print(f"Attractions page {page_number} failed: {error}")
-                break
 
-            products = extract_products(payload)
-            if not products:
-                print(f"Attractions page {page_number}: no products returned.")
-                break
-
-            added = 0
-            for product in products:
-                key = str(product.get("attraction_id") or product.get("name") or "")
-                if key and key not in all_attractions:
-                    all_attractions[key] = product
-                    added += 1
+                if not has_next_page(payload) or len(products) < ATTRACTIONS_PER_PAGE:
+                    break
+                await page.wait_for_timeout(1000)
 
             print(
-                f"Attractions page {page_number:>3} | "
-                f"received {len(products):>2} | new {added:>2} | "
-                f"total unique {len(all_attractions)}"
+                f"Finished {destination_name}: "
+                f"{len(all_attractions) - destination_start_count} new unique attractions."
             )
+            print()
 
-            if not has_next_page(payload) or len(products) < ATTRACTIONS_PER_PAGE:
-                break
-            await page.wait_for_timeout(1000)
+        for destination in destinations:
+            await scrape_destination(destination)
 
         return await enrich_attractions_with_detail_pages(
             context,
@@ -1094,11 +1475,30 @@ async def scrape_reviews_for_attraction(
     reviews: list[dict[str, Any]] = []
     seen_keys: set[str] = set()
     cutoff_date = review_cutoff_date()
+    structured_total: int | None = None
+
+    async def add_visible_reviews() -> int:
+        visible_reviews = await scrape_visible_attraction_review_cards(
+            page,
+            attraction,
+            existing_source_review_ids,
+        )
+        added = 0
+        for review in visible_reviews:
+            source_review_id = stable_review_id(review)
+            if source_review_id in existing_source_review_ids:
+                continue
+            key = attraction_review_content_key(review)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            reviews.append(review)
+            added += 1
+        return added
 
     for page_number in range(MAX_REVIEW_PAGES_PER_HOTEL):
-        offset = page_number * REVIEWS_PER_PAGE
         page_body = json.loads(json.dumps(original_body))
-        update_review_pagination(page_body, offset)
+        prepare_attraction_review_request_body(page_body, page_number + 1)
         try:
             payload = await fetch_graphql_page(
                 page=page,
@@ -1109,6 +1509,9 @@ async def scrape_reviews_for_attraction(
         except Exception as error:
             print(f"  Attraction review page {page_number + 1} failed: {error}")
             break
+
+        if structured_total is None:
+            structured_total = attraction_review_total(payload)
 
         raw_reviews = find_review_items(payload)
         if not raw_reviews:
@@ -1133,7 +1536,6 @@ async def scrape_reviews_for_attraction(
                 normalize_review(raw_review, {"hotel_id": attraction_source_place_id(attraction)}),
                 attraction,
             )
-            key = review_seen_key(review)
             source_review_id = stable_review_id(review)
             collect, should_stop, _reason = should_collect_review(
                 review,
@@ -1147,8 +1549,9 @@ async def scrape_reviews_for_attraction(
                 if should_stop:
                     existing_encountered = True
                 continue
-            if key not in seen_keys:
-                seen_keys.add(key)
+            content_key = attraction_review_content_key(review)
+            if content_key not in seen_keys:
+                seen_keys.add(content_key)
                 reviews.append(review)
                 added += 1
 
@@ -1162,6 +1565,9 @@ async def scrape_reviews_for_attraction(
             break
         if page_number > 0 and added == 0:
             print("  No new attraction reviews found on this page. Stopping collection.")
+            break
+        if structured_total is not None and len(reviews) >= structured_total:
+            print("  Reached the API-reported attraction review total.")
             break
         if len(raw_reviews) < REVIEWS_PER_PAGE:
             break

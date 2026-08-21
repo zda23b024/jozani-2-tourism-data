@@ -193,6 +193,7 @@ REVIEW_COLUMNS = [
     "sentiment",
     "emotion",
     "spam_score",
+    "raw_json",
     "created_at",
     "updated_at",
 ]
@@ -205,6 +206,7 @@ REVIEW_RESPONSE_COLUMNS = [
     "responder_role",
     "response_text",
     "response_date",
+    "raw_json",
     "created_at",
     "updated_at",
 ]
