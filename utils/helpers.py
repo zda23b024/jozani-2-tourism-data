@@ -138,10 +138,10 @@ def parse_date(value: Any) -> _date | None:
     """
     if value is None:
         return None
-    if isinstance(value, _date):
-        return value
     if isinstance(value, _datetime):
         return value.date()
+    if isinstance(value, _date):
+        return value
     try:
         text = str(value).strip()
         if not text:

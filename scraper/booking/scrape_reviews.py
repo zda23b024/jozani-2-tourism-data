@@ -11,6 +11,7 @@ from playwright.async_api import BrowserContext, Page, Request
 from config.configuration import (
     CHECKIN,
     CHECKOUT,
+    HOTEL_REVIEW_CONCURRENCY,
     MAX_REVIEW_PAGES_PER_HOTEL,
     REVIEWS_PER_PAGE,
 )
@@ -20,6 +21,7 @@ from utils.browser_helpers import (
     fetch_graphql_page,
     parse_request_body,
 )
+from utils.console_output import print_review_header, print_review_progress
 from utils.helpers import (
     first_nonempty,
     hotel_stay_url,
@@ -565,7 +567,6 @@ async def scrape_reviews_for_hotel(
         raw_reviews = find_review_items(payload)
         if not raw_reviews:
             empty_pages += 1
-            print(f"  Reviews page {page_number + 1}: 0 reviews")
             if empty_pages >= 2:
                 break
             await page.wait_for_timeout(800)
@@ -593,10 +594,6 @@ async def scrape_reviews_for_hotel(
                 reviews.append(review)
                 added += 1
 
-        print(
-            f"  Reviews page {page_number + 1}: received {len(raw_reviews)}, "
-            f"new {added}, skipped {skipped}, total {len(reviews)}"
-        )
         if len(raw_reviews) < REVIEWS_PER_PAGE:
             break
         await page.wait_for_timeout(800)
@@ -755,10 +752,6 @@ async def scrape_reviewlist_fallback(
                 reviews.append(review)
                 added += 1
 
-        print(
-            f"  Reviewlist page {page_number + 1}: received {len(page_reviews)}, "
-            f"new {added}, skipped {skipped}, total {len(reviews)}"
-        )
         if not page_reviews:
             empty_pages += 1
             if empty_pages >= 2:
@@ -783,27 +776,77 @@ async def scrape_reviews_for_hotels(
         if hotel.get("sold_out") is not True and hotel.get("property_url")
     ]
     all_reviews: list[dict[str, Any]] = []
-    review_page = await context.new_page()
-    try:
-        print()
-        print("=" * 60)
-        print("COLLECTING HOTEL REVIEWS")
-        print("=" * 60)
-        print(f"Available hotels with URLs: {len(available_hotels)}")
-        for index, hotel in enumerate(available_hotels, start=1):
-            print(f"[{index}/{len(available_hotels)}] {hotel.get('name') or hotel.get('hotel_id')}")
-            hotel_id = str(hotel.get("hotel_id") or "")
-            try:
-                reviews = await scrape_reviews_for_hotel(
-                    review_page,
-                    hotel,
-                    incremental_state_by_hotel.get(hotel_id, {}),
-                )
-            except Exception as error:
-                print(f"  Review collection failed. Skipping hotel: {error}")
-                reviews = []
-            all_reviews.extend(reviews)
-            await review_page.wait_for_timeout(1200)
-    finally:
-        await review_page.close()
+    concurrency = max(1, min(HOTEL_REVIEW_CONCURRENCY, len(available_hotels) or 1))
+
+    print_review_header("Hotel")
+    print(f"Available hotels with URLs: {len(available_hotels)}")
+    print(f"Hotel review concurrency: {concurrency}")
+
+    if not available_hotels:
+        return all_reviews
+
+    queue: asyncio.Queue[tuple[int, dict[str, Any]]] = asyncio.Queue()
+    for item in enumerate(available_hotels, start=1):
+        queue.put_nowait(item)
+
+    async def worker(worker_number: int) -> None:
+        review_page = await context.new_page()
+        try:
+            while True:
+                try:
+                    index, hotel = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+
+                try:
+                    reviews = await scrape_hotel_review_item(
+                        review_page,
+                        hotel,
+                        index,
+                        len(available_hotels),
+                        incremental_state_by_hotel,
+                        worker_number,
+                    )
+                    all_reviews.extend(reviews)
+                finally:
+                    queue.task_done()
+                    await review_page.wait_for_timeout(1200)
+        finally:
+            await review_page.close()
+
+    await asyncio.gather(*(worker(index) for index in range(1, concurrency + 1)))
     return all_reviews
+
+
+async def scrape_hotel_review_item(
+    page: Page,
+    hotel: dict[str, Any],
+    index: int,
+    total: int,
+    incremental_state_by_hotel: dict[str, Any],
+    worker_number: int,
+) -> list[dict[str, Any]]:
+    hotel_id = str(hotel.get("hotel_id") or "")
+    try:
+        reviews = await scrape_reviews_for_hotel(
+            page,
+            hotel,
+            incremental_state_by_hotel.get(hotel_id, {}),
+        )
+        print_review_progress(
+            index,
+            total,
+            hotel.get("name") or hotel.get("hotel_id"),
+            len(reviews),
+        )
+        return reviews
+    except Exception as error:
+        print(f"  Review collection failed. Skipping hotel: {error}")
+        print_review_progress(
+            index,
+            total,
+            hotel.get("name") or hotel.get("hotel_id"),
+            0,
+            failed=True,
+        )
+        return []

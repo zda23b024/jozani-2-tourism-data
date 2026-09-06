@@ -10,7 +10,7 @@ from database.models import TABLE_COLUMNS, TABLE_CONFLICT_COLUMNS
 from utils.helpers import safe_filename
 
 
-PLATFORM_IDS = ("booking",)
+PLATFORM_IDS = ("booking", "tripadvisor", "multi")
 COMMON_TABLES = {"sources", "place_types", "locations", "scraping_runs"}
 
 

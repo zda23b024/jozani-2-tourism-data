@@ -4,6 +4,8 @@ This project is a Booking.com data collection prototype for tourism intelligence
 
 The current configured destination is Zanzibar City, Tanzania.
 
+The scraper supports Booking.com and Tripadvisor hotel/property collection. For production use, prefer official APIs, partner feeds, exported data, or other permitted access methods where available, and respect each site's terms, robots rules, rate limits, and anti-abuse restrictions. The scraper does not bypass CAPTCHAs or access controls.
+
 ## What It Collects
 
 - Hotels and accommodation metadata
@@ -87,6 +89,15 @@ HEADLESS = False
 
 For Booking.com attractions, `ATTRACTIONS_DEST_ID` must match the destination.
 
+Tripadvisor discovery starts from the wider Zanzibar Island area (`g482884`):
+
+```text
+TRIPADVISOR_SEARCH_URL=https://www.tripadvisor.com/Hotels-g482884-Zanzibar_Island_Zanzibar_Archipelago-Hotels.html
+TRIPADVISOR_ATTRACTIONS_URL=https://www.tripadvisor.com/Attractions-g482884-Activities-Zanzibar_Island_Zanzibar_Archipelago.html
+TRIPADVISOR_RESTAURANTS_URL=https://www.tripadvisor.com/Restaurants-g482884-Zanzibar_Island_Zanzibar_Archipelago.html
+TRIPADVISOR_FIND_RESTAURANTS_URL=https://www.tripadvisor.com/FindRestaurants?geo=482884&sort=POPULARITY&establishmentTypes=10591,11776,9900,9909&broadened=false
+```
+
 ## Running
 
 ```powershell
@@ -100,6 +111,29 @@ python main.py
 ```
 
 This collects today's date-based prices and availability, plus new reviews.
+
+Booking.com only:
+
+```powershell
+python main.py --source booking
+```
+
+Tripadvisor only:
+
+```powershell
+python main.py --source tripadvisor
+python main.py --source tripadvisor --only hotels
+python main.py --source tripadvisor --only attractions
+python main.py --source tripadvisor --only restaurants
+```
+
+Booking.com and Tripadvisor:
+
+```powershell
+python main.py --source both
+```
+
+Tripadvisor currently supports hotels, attractions, restaurants, and review collection for each scraped Tripadvisor place type.
 
 Full base dataset run:
 
@@ -151,12 +185,74 @@ python main.py --daily --only hotels
 python main.py --daily --only attractions
 ```
 
+The Tripadvisor scraper uses dedicated Tripadvisor parsing logic based on hotel review/detail links and visible page text. Because Tripadvisor changes markup often and may require normal user verification, selectors should be live-tested after deployment.
+
 Each run saves:
 
 - CSV output under `output/csv`
 - JSON output under `output/json`
 - A run log under `output/logs`
 - Normalized records into PostgreSQL
+
+## Docker
+
+The Docker setup runs the existing backend/data-collection scraper only. There is no FastAPI app in this project and no Alembic configuration; the Python application creates or updates the PostgreSQL schema through `database/create_tables.py`.
+
+Create your Docker environment file:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+For Docker, keep these values:
+
+```text
+PGHOST=db
+HEADLESS=true
+```
+
+Build the image and start PostgreSQL:
+
+```powershell
+docker compose build
+docker compose up -d db
+```
+
+Initialize or update the database schema:
+
+```powershell
+docker compose run --rm app python scripts/apply_schema.py
+```
+
+Run validation checks inside Docker:
+
+```powershell
+docker compose run --rm app python scripts/docker_db_check.py
+docker compose run --rm app python scripts/docker_playwright_check.py
+docker compose run --rm app python -m unittest discover tests
+```
+
+Run the scraper:
+
+```powershell
+docker compose run --rm app python main.py
+```
+
+Examples:
+
+```powershell
+docker compose run --rm app python main.py --catalog --source tripadvisor --only restaurants
+docker compose run --rm app python main.py --catalog --source tripadvisor --only attractions
+docker compose run --rm app python main.py --source both
+```
+
+Generated outputs are persisted to the host `output` directory, and browser profiles are persisted to the host `browser` directory.
+
+Stop the Docker services:
+
+```powershell
+docker compose down
+```
 
 ## Key Database Tables
 

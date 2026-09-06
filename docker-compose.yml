@@ -1,0 +1,39 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${PGDATABASE:-zanzibar_booking_data}
+      POSTGRES_USER: ${PGUSER:-postgres}
+      POSTGRES_PASSWORD: ${PGPASSWORD:-change_this_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  app:
+    build: .
+    env_file:
+      - .env
+    environment:
+      HEADLESS: "true"
+      PGHOST: db
+      PGPORT: ${PGPORT:-5432}
+      PGDATABASE: ${PGDATABASE:-zanzibar_booking_data}
+      PGUSER: ${PGUSER:-postgres}
+      PGPASSWORD: ${PGPASSWORD:-change_this_password}
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./output:/app/output
+      - ./browser:/app/browser
+    command: ["python", "main.py"]
+    stdin_open: true
+    tty: true
+
+volumes:
+  postgres_data:

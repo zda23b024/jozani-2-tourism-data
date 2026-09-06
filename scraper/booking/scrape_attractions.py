@@ -1,7 +1,9 @@
 import asyncio
+import itertools
 import json
 import re
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote_plus
 
@@ -10,13 +12,16 @@ from playwright.async_api import BrowserContext, Page, Request
 from config.configuration import (
     CATALOG_ATTRACTION_DESTINATIONS,
     ATTRACTION_REVIEW_DEBUG_DIR,
+    ATTRACTION_REVIEW_CONCURRENCY,
     ATTRACTIONS_DEST_ID,
     ATTRACTIONS_PER_PAGE,
     ATTRACTIONS_URL,
     ATTRACTION_API_CAPTURE_TIMEOUT_SECONDS,
+    BOOKING_ATTRACTION_REVIEW_PLACE_LIMIT,
     CHECKIN,
     CHECKOUT,
     MAX_ATTRACTION_PAGES,
+    MAX_REVIEW_PAGES_PER_ATTRACTION,
     REVIEWS_PER_PAGE,
 )
 from utils.browser_helpers import (
@@ -24,6 +29,12 @@ from utils.browser_helpers import (
     build_fetch_headers,
     fetch_graphql_page,
     parse_request_body,
+)
+from utils.console_output import (
+    print_catalog_complete,
+    print_category_header,
+    print_review_header,
+    print_review_progress,
 )
 from utils.helpers import (
     first_nonempty,
@@ -36,10 +47,28 @@ from utils.helpers import (
 from scraper.booking.scrape_reviews import (
     find_review_items,
     normalize_review,
-    review_page_numbers,
     review_cutoff_date,
     should_collect_review,
 )
+
+
+SENSITIVE_DEBUG_KEYS = {
+    "authorization",
+    "cookie",
+    "csrf",
+    "token",
+    "session",
+    "datadome",
+    "auth",
+    "password",
+}
+
+
+@dataclass
+class AttractionReviewCapture:
+    request: Request
+    request_body: dict[str, Any]
+    response_payload: dict[str, Any] | None
 
 
 def is_attraction_search_request(request: Request) -> bool:
@@ -69,10 +98,185 @@ def is_attraction_review_request(request: Request) -> bool:
     query = str(body.get("query") or "").lower()
     combined = f"{operation_name}\n{query}"
     return (
-        "review" in combined
+        ("getreviewsv3" in operation_name or "getreviewsv3" in query)
         and "attractionsproduct" in combined
         and "searchproducts" not in combined
     )
+
+
+def sanitized_debug_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        sanitized = {}
+        for key, child in value.items():
+            key_text = str(key).lower()
+            if any(marker in key_text for marker in SENSITIVE_DEBUG_KEYS):
+                sanitized[key] = "[REDACTED]"
+            else:
+                sanitized[key] = sanitized_debug_value(child)
+        return sanitized
+    if isinstance(value, list):
+        return [sanitized_debug_value(child) for child in value]
+    return value
+
+
+def graphql_operation_name(body: dict[str, Any]) -> str | None:
+    return first_nonempty(body.get("operationName"), nested_get(body, "extensions", "operationName"))
+
+
+def graphql_query_identifier(body: dict[str, Any]) -> str | None:
+    extensions = body.get("extensions") if isinstance(body.get("extensions"), dict) else {}
+    persisted = extensions.get("persistedQuery") if isinstance(extensions.get("persistedQuery"), dict) else {}
+    return first_nonempty(
+        extensions.get("preRegisteredQueryId"),
+        extensions.get("sha256Hash"),
+        persisted.get("sha256Hash"),
+        body.get("queryId"),
+        body.get("id"),
+    )
+
+
+def variable_keys(body: dict[str, Any]) -> list[str]:
+    variables = body.get("variables")
+    if not isinstance(variables, dict):
+        return []
+
+    keys: set[str] = set()
+
+    def visit(value: Any, prefix: str = "") -> None:
+        if isinstance(value, dict):
+            for key, child in value.items():
+                path = f"{prefix}.{key}" if prefix else str(key)
+                keys.add(path)
+                visit(child, path)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child, prefix)
+
+    visit(variables)
+    return sorted(keys)
+
+
+def pagination_values(value: Any, prefix: str = "") -> dict[str, Any]:
+    names = {
+        "offset",
+        "skip",
+        "page",
+        "pagenumber",
+        "pagination",
+        "pagesize",
+        "limit",
+        "rowsperpage",
+        "first",
+    }
+    found: dict[str, Any] = {}
+    if isinstance(value, dict):
+        for key, child in value.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if str(key).lower() in names:
+                found[path] = sanitized_debug_value(child)
+            found.update(pagination_values(child, path))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            found.update(pagination_values(child, f"{prefix}[{index}]"))
+    return found
+
+
+def attraction_review_response_info(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {"contains_reviews": False, "review_path": None, "review_count": 0, "total": None}
+    total = attraction_review_total(payload)
+    explicit_reviews = nested_get(
+        payload,
+        "data",
+        "attractionsProduct",
+        "getReviewsV3",
+        "reviews",
+    )
+    contains_reviews = isinstance(explicit_reviews, list)
+    return {
+        "contains_reviews": contains_reviews,
+        "review_path": (
+            "data.attractionsProduct.getReviewsV3.reviews"
+            if isinstance(explicit_reviews, list)
+            else None
+        ),
+        "review_count": len(explicit_reviews) if isinstance(explicit_reviews, list) else 0,
+        "total": total,
+    }
+
+
+def print_attraction_review_request_diagnostics(
+    attraction: dict[str, Any],
+    request: Request,
+    original_body: dict[str, Any],
+    replay_body: dict[str, Any] | None = None,
+) -> None:
+    source_place_id = attraction_source_place_id(attraction)
+    print("  Structured attraction review request diagnostics:")
+    print(f"    attraction: {attraction.get('name')}")
+    print(f"    product_id: {source_place_id}")
+    print(f"    page_url: {attraction.get('property_url')}")
+    print(f"    request_url: {request.url}")
+    print(f"    method: {request.method}")
+    print(f"    operation: {graphql_operation_name(original_body)}")
+    print(f"    query_id: {graphql_query_identifier(original_body)}")
+    print(f"    variable_keys: {', '.join(variable_keys(original_body)) or '(none)'}")
+    print(f"    original_pagination: {json.dumps(pagination_values(original_body), ensure_ascii=False)}")
+    if replay_body is not None:
+        print(f"    replay_pagination: {json.dumps(pagination_values(replay_body), ensure_ascii=False)}")
+
+
+async def fetch_graphql_page_with_debug(
+    page: Page,
+    endpoint_url: str,
+    headers: dict[str, str],
+    body: dict[str, Any],
+) -> dict[str, Any]:
+    return await page.evaluate(
+        """
+        async ({url, headers, body}) => {
+            const response = await fetch(url, {
+                method: "POST",
+                headers,
+                credentials: "include",
+                body: JSON.stringify(body)
+            });
+            const responseText = await response.text();
+            let parsed = null;
+            try { parsed = JSON.parse(responseText); }
+            catch (_) {}
+            return {
+                ok: response.ok,
+                status: response.status,
+                statusText: response.statusText,
+                contentType: response.headers.get("content-type") || "",
+                responseText,
+                data: parsed
+            };
+        }
+        """,
+        {"url": endpoint_url, "headers": headers, "body": body},
+    )
+
+
+async def save_attraction_review_request_debug(
+    attraction: dict[str, Any],
+    label: str,
+    data: dict[str, Any],
+) -> None:
+    source_place_id = attraction_source_place_id(attraction)
+    path = ATTRACTION_REVIEW_DEBUG_DIR / (
+        f"{safe_filename(source_place_id)}_{safe_filename(label)}.json"
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.write_text(
+            json.dumps(sanitized_debug_value(data), indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        print(f"  Attraction review request debug saved: {path}")
+    except Exception as error:
+        print(f"  Attraction review request debug save failed: {error}")
 
 
 def remove_catalog_attraction_date_filters(value: Any) -> None:
@@ -205,18 +409,56 @@ async def wait_for_attraction_request(
 async def wait_for_attraction_review_request(
     page: Page,
     attraction: dict[str, Any],
-) -> Request | None:
-    captured_request = None
+) -> AttractionReviewCapture | None:
+    captured_request: Request | None = None
+    captured_body: dict[str, Any] | None = None
+    captured_response_payload: dict[str, Any] | None = None
     request_found = asyncio.Event()
+    response_tasks: set[asyncio.Task] = set()
 
-    async def request_handler(request: Request) -> None:
-        nonlocal captured_request
-        if captured_request is None and is_attraction_review_request(request):
-            captured_request = request
-            request_found.set()
-            print("  Review panel opened; checking structured review data.")
+    async def response_handler(response: Any) -> None:
+        nonlocal captured_request, captured_body, captured_response_payload
+        if captured_request is not None:
+            return
+        request = response.request
+        if not is_attraction_review_request(request):
+            return
+        body = parse_request_body(request)
+        if not isinstance(body, dict):
+            return
+        try:
+            payload = await response.json()
+        except Exception:
+            payload = None
+        response_info = attraction_review_response_info(payload)
+        if not response_info["contains_reviews"]:
+            await save_attraction_review_request_debug(
+                attraction,
+                "ignored_non_review_request",
+                {
+                    "reason": "candidate request response did not contain attraction reviews",
+                    "request_url": request.url,
+                    "method": request.method,
+                    "operation": graphql_operation_name(body),
+                    "query_id": graphql_query_identifier(body),
+                    "variable_keys": variable_keys(body),
+                    "pagination": pagination_values(body),
+                    "response_info": response_info,
+                },
+            )
+            return
+        captured_request = request
+        captured_body = body
+        captured_response_payload = payload if isinstance(payload, dict) else None
+        request_found.set()
+        print("  Review panel opened; confirmed structured review data.")
 
-    page.on("request", request_handler)
+    def schedule_response_handler(response: Any) -> None:
+        task = asyncio.create_task(response_handler(response))
+        response_tasks.add(task)
+        task.add_done_callback(response_tasks.discard)
+
+    page.on("response", schedule_response_handler)
     try:
         url = attraction.get("property_url")
         if not url:
@@ -262,12 +504,20 @@ async def wait_for_attraction_review_request(
             await asyncio.wait_for(request_found.wait(), timeout=15)
         except asyncio.TimeoutError:
             pass
-        return captured_request
+        if captured_request is None or captured_body is None:
+            return None
+        return AttractionReviewCapture(
+            request=captured_request,
+            request_body=captured_body,
+            response_payload=captured_response_payload,
+        )
     finally:
         try:
-            page.remove_listener("request", request_handler)
+            page.remove_listener("response", schedule_response_handler)
         except Exception:
             pass
+        if response_tasks:
+            await asyncio.gather(*response_tasks, return_exceptions=True)
 
 
 def clean_visible_review_text(value: str) -> str:
@@ -1233,41 +1483,55 @@ def attraction_review_content_key(review: dict[str, Any]) -> str:
     )
 
 
+def attraction_review_page_numbers() -> range | itertools.count:
+    if MAX_REVIEW_PAGES_PER_ATTRACTION is None:
+        return itertools.count()
+    return range(MAX_REVIEW_PAGES_PER_ATTRACTION)
+
+
 def prepare_attraction_review_request_body(body: dict[str, Any], page_number: int) -> None:
     input_data = nested_get(body, "variables", "input")
     if not isinstance(input_data, dict):
         return
 
-    page_size = REVIEWS_PER_PAGE
     pagination = input_data.get("pagination")
     if isinstance(pagination, dict):
+        page_size = pagination.get("pageSize") or pagination.get("rowsPerPage") or pagination.get("limit")
         try:
-            page_size = max(page_size, int(pagination.get("pageSize") or page_size))
+            page_size_int = int(page_size) if page_size not in (None, "") else None
         except (TypeError, ValueError):
-            page_size = REVIEWS_PER_PAGE
+            page_size_int = None
+        if "page" in pagination:
+            pagination["page"] = page_number
+        if "pageNumber" in pagination:
+            pagination["pageNumber"] = page_number
+        if "offset" in pagination and page_size_int is not None:
+            pagination["offset"] = (page_number - 1) * page_size_int
+        if "skip" in pagination and page_size_int is not None:
+            pagination["skip"] = (page_number - 1) * page_size_int
 
-    filters = input_data.get("filterBy")
-    if isinstance(filters, list):
-        input_data["filterBy"] = [
-            item
-            for item in filters
-            if not (
-                isinstance(item, dict)
-                and str(item.get("filterType") or "").lower()
-                in {"score_range", "language"}
-            )
-        ]
+    page_size = first_nonempty(
+        nested_get(input_data, "pagination", "pageSize"),
+        nested_get(input_data, "pagination", "rowsPerPage"),
+        nested_get(input_data, "pagination", "limit"),
+        input_data.get("pageSize"),
+        input_data.get("rowsPerPage"),
+        input_data.get("limit"),
+        REVIEWS_PER_PAGE,
+    )
+    try:
+        page_size_int = int(page_size)
+    except (TypeError, ValueError):
+        page_size_int = REVIEWS_PER_PAGE
 
-    input_data["pagination"] = {
-        "page": page_number,
-        "pageSize": page_size,
-    }
-    input_data["sortBy"] = "newest"
-    input_data.pop("offset", None)
-    input_data.pop("skip", None)
-    input_data.pop("page", None)
-    input_data.pop("limit", None)
-    input_data.pop("rowsPerPage", None)
+    if "page" in input_data:
+        input_data["page"] = page_number
+    if "pageNumber" in input_data:
+        input_data["pageNumber"] = page_number
+    if "offset" in input_data:
+        input_data["offset"] = (page_number - 1) * page_size_int
+    if "skip" in input_data:
+        input_data["skip"] = (page_number - 1) * page_size_int
 
 
 async def save_attraction_review_debug(page: Page, attraction: dict[str, Any]) -> None:
@@ -1325,10 +1589,7 @@ async def scrape_attractions_in_context(
     page = await context.new_page()
     all_attractions: dict[str, dict[str, Any]] = {}
     try:
-        print()
-        print("=" * 60)
-        print("COLLECTING BOOKING.COM ATTRACTIONS")
-        print("=" * 60)
+        print_category_header("Booking.com", "Attractions")
 
         destinations = (
             CATALOG_ATTRACTION_DESTINATIONS
@@ -1385,7 +1646,12 @@ async def scrape_attractions_in_context(
 
             destination_start_count = len(all_attractions)
 
-            for page_number in range(1, MAX_ATTRACTION_PAGES + 1):
+            page_numbers = (
+                itertools.count(1)
+                if MAX_ATTRACTION_PAGES is None
+                else range(1, MAX_ATTRACTION_PAGES + 1)
+            )
+            for page_number in page_numbers:
                 page_body = deepcopy(template_body)
                 page_body["variables"]["input"]["page"] = page_number
                 page_body["variables"]["input"]["limit"] = ATTRACTIONS_PER_PAGE
@@ -1436,6 +1702,7 @@ async def scrape_attractions_in_context(
         for destination in destinations:
             await scrape_destination(destination)
 
+        print_catalog_complete("Attractions", len(all_attractions))
         return await enrich_attractions_with_detail_pages(
             context,
             list(all_attractions.values()),
@@ -1451,12 +1718,12 @@ async def scrape_reviews_for_attraction(
 ) -> list[dict[str, Any]]:
     existing_source_review_ids = existing_source_review_ids or set()
     try:
-        review_request = await wait_for_attraction_review_request(page, attraction)
+        review_capture = await wait_for_attraction_review_request(page, attraction)
     except Exception as error:
         print(f"  Attraction review page could not be opened. Skipping: {error}")
         return []
 
-    if review_request is None:
+    if review_capture is None:
         print("  No attraction review API request captured.")
         return await scrape_visible_attraction_review_cards(
             page,
@@ -1464,11 +1731,13 @@ async def scrape_reviews_for_attraction(
             existing_source_review_ids,
         )
 
-    original_body = parse_request_body(review_request)
+    review_request = review_capture.request
+    original_body = review_capture.request_body
     if not isinstance(original_body, dict):
         print("  Could not parse attraction review request body.")
         return []
 
+    initial_response_info = attraction_review_response_info(review_capture.response_payload)
     endpoint_url = review_request.url
     headers = await build_fetch_headers(review_request)
     reviews: list[dict[str, Any]] = []
@@ -1492,18 +1761,83 @@ async def scrape_reviews_for_attraction(
             added += 1
         return added
 
-    for page_number in review_page_numbers():
-        page_body = json.loads(json.dumps(original_body))
+    for page_number in attraction_review_page_numbers():
+        page_body = deepcopy(original_body)
         prepare_attraction_review_request_body(page_body, page_number + 1)
-        try:
-            payload = await fetch_graphql_page(
-                page=page,
-                endpoint_url=endpoint_url,
-                headers=headers,
-                body=page_body,
+        print_attraction_review_request_diagnostics(
+            attraction,
+            review_request,
+            original_body,
+            page_body,
+        )
+        print(
+            "  Captured response review path: "
+            f"{initial_response_info.get('review_path') or '(none)'} | "
+            f"reviews={initial_response_info.get('review_count')} | "
+            f"total={initial_response_info.get('total')}"
+        )
+
+        result = await fetch_graphql_page_with_debug(
+            page=page,
+            endpoint_url=endpoint_url,
+            headers=headers,
+            body=page_body,
+        )
+        if not result.get("ok"):
+            print(
+                f"  Attraction review page {page_number + 1} failed: "
+                f"GraphQL request failed: {result.get('status')} {result.get('statusText')}"
             )
-        except Exception as error:
-            print(f"  Attraction review page {page_number + 1} failed: {error}")
+            print(f"  HTTP status: {result.get('status')}")
+            print(f"  Response Content-Type: {result.get('contentType')}")
+            print(
+                "  Response body preview: "
+                f"{str(result.get('responseText') or '')[:1500]}"
+            )
+            await save_attraction_review_request_debug(
+                attraction,
+                f"page_{page_number + 1}_http_{result.get('status')}",
+                {
+                    "attraction_name": attraction.get("name"),
+                    "product_id": attraction_source_place_id(attraction),
+                    "page_url": attraction.get("property_url"),
+                    "request_url": endpoint_url,
+                    "method": review_request.method,
+                    "operation": graphql_operation_name(original_body),
+                    "query_id": graphql_query_identifier(original_body),
+                    "variable_keys": variable_keys(original_body),
+                    "original_pagination": pagination_values(original_body),
+                    "replay_pagination": pagination_values(page_body),
+                    "status": result.get("status"),
+                    "status_text": result.get("statusText"),
+                    "content_type": result.get("contentType"),
+                    "response_body_preview": str(result.get("responseText") or "")[:1500],
+                    "sanitized_replay_payload": page_body,
+                },
+            )
+            break
+
+        payload = result.get("data")
+        if not isinstance(payload, dict):
+            print(f"  Attraction review page {page_number + 1} failed: invalid JSON response")
+            await save_attraction_review_request_debug(
+                attraction,
+                f"page_{page_number + 1}_invalid_json",
+                {
+                    "attraction_name": attraction.get("name"),
+                    "product_id": attraction_source_place_id(attraction),
+                    "page_url": attraction.get("property_url"),
+                    "request_url": endpoint_url,
+                    "method": review_request.method,
+                    "operation": graphql_operation_name(original_body),
+                    "query_id": graphql_query_identifier(original_body),
+                    "variable_keys": variable_keys(original_body),
+                    "original_pagination": pagination_values(original_body),
+                    "replay_pagination": pagination_values(page_body),
+                    "response_body_preview": str(result.get("responseText") or "")[:1500],
+                    "sanitized_replay_payload": page_body,
+                },
+            )
             break
 
         if structured_total is None:
@@ -1548,11 +1882,6 @@ async def scrape_reviews_for_attraction(
                 reviews.append(review)
                 added += 1
 
-        print(
-            f"  Structured attraction review page {page_number + 1}: "
-            f"received {len(raw_reviews)}, new {added}, skipped {skipped}, "
-            f"total {len(reviews)}"
-        )
         if page_number > 0 and added == 0:
             print("  No additional attraction reviews found on this page. Stopping collection.")
             break
@@ -1577,32 +1906,83 @@ async def scrape_reviews_for_attractions(
         for attraction in attractions
         if attraction.get("property_url")
     ]
+    if BOOKING_ATTRACTION_REVIEW_PLACE_LIMIT is not None:
+        reviewable_attractions = reviewable_attractions[:BOOKING_ATTRACTION_REVIEW_PLACE_LIMIT]
     all_reviews: list[dict[str, Any]] = []
-    page = await context.new_page()
-    try:
-        print()
-        print("=" * 60)
-        print("COLLECTING ATTRACTION REVIEWS")
-        print("=" * 60)
-        print(f"Attractions with URLs: {len(reviewable_attractions)}")
-        for index, attraction in enumerate(reviewable_attractions, start=1):
-            print(
-                f"[{index}/{len(reviewable_attractions)}] "
-                f"{attraction.get('name') or attraction.get('attraction_id')}"
-            )
-            source_place_id = attraction_source_place_id(attraction)
-            place_source_id = attraction_place_source_id(source_place_id)
-            try:
-                reviews = await scrape_reviews_for_attraction(
-                    page,
-                    attraction,
-                    existing_review_ids_by_place_source_id.get(place_source_id, set()),
-                )
-            except Exception as error:
-                print(f"  Attraction review collection failed. Skipping: {error}")
-                reviews = []
-            all_reviews.extend(reviews)
-            await page.wait_for_timeout(1000)
-    finally:
-        await page.close()
+    concurrency = max(1, min(ATTRACTION_REVIEW_CONCURRENCY, len(reviewable_attractions) or 1))
+
+    print_review_header("Attraction")
+    print(f"Attractions with URLs: {len(reviewable_attractions)}")
+    if BOOKING_ATTRACTION_REVIEW_PLACE_LIMIT is not None:
+        print(f"Attraction review place test limit: {BOOKING_ATTRACTION_REVIEW_PLACE_LIMIT}")
+    print(f"Attraction review concurrency: {concurrency}")
+
+    if not reviewable_attractions:
+        return all_reviews
+
+    queue: asyncio.Queue[tuple[int, dict[str, Any]]] = asyncio.Queue()
+    for item in enumerate(reviewable_attractions, start=1):
+        queue.put_nowait(item)
+
+    async def worker(worker_number: int) -> None:
+        page = await context.new_page()
+        try:
+            while True:
+                try:
+                    index, attraction = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    return
+
+                try:
+                    reviews = await scrape_attraction_review_item(
+                        page,
+                        attraction,
+                        index,
+                        len(reviewable_attractions),
+                        existing_review_ids_by_place_source_id,
+                        worker_number,
+                    )
+                    all_reviews.extend(reviews)
+                finally:
+                    queue.task_done()
+                    await page.wait_for_timeout(1000)
+        finally:
+            await page.close()
+
+    await asyncio.gather(*(worker(index) for index in range(1, concurrency + 1)))
     return all_reviews
+
+
+async def scrape_attraction_review_item(
+    page: Page,
+    attraction: dict[str, Any],
+    index: int,
+    total: int,
+    existing_review_ids_by_place_source_id: dict[str, set[str]],
+    worker_number: int,
+) -> list[dict[str, Any]]:
+    source_place_id = attraction_source_place_id(attraction)
+    place_source_id = attraction_place_source_id(source_place_id)
+    try:
+        reviews = await scrape_reviews_for_attraction(
+            page,
+            attraction,
+            existing_review_ids_by_place_source_id.get(place_source_id, set()),
+        )
+        print_review_progress(
+            index,
+            total,
+            attraction.get("name") or attraction.get("attraction_id"),
+            len(reviews),
+        )
+        return reviews
+    except Exception as error:
+        print(f"  Attraction review collection failed. Skipping: {error}")
+        print_review_progress(
+            index,
+            total,
+            attraction.get("name") or attraction.get("attraction_id"),
+            0,
+            failed=True,
+        )
+        return []

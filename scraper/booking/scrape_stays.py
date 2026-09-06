@@ -1,4 +1,5 @@
 import asyncio
+import itertools
 import re
 from copy import deepcopy
 from typing import Any
@@ -19,6 +20,11 @@ from config.configuration import (
     SEARCH_API_CAPTURE_TIMEOUT_SECONDS,
     SEARCH_TERM,
     SEARCH_URL,
+    STAYS_AID,
+    STAYS_DEST_ID,
+    STAYS_DEST_TYPE,
+    STAYS_LANGUAGE,
+    STAYS_SEARCH_TERM,
 )
 from utils.browser_helpers import (
     accept_cookies,
@@ -28,6 +34,7 @@ from utils.browser_helpers import (
     launch_context,
     parse_request_body,
 )
+from utils.console_output import print_catalog_complete, print_category_header
 from utils.helpers import (
     find_property_url,
     first_nonempty,
@@ -52,6 +59,21 @@ def hotel_dedupe_key(hotel: dict[str, Any]) -> str:
 
 def stays_search_url(search_term: str, catalog_mode: bool) -> str:
     if catalog_mode:
+        if search_term == STAYS_SEARCH_TERM:
+            return (
+                f"https://www.booking.com/searchresults.{STAYS_LANGUAGE}.html"
+                f"?ss={quote_plus(search_term)}"
+                f"&ssne={quote_plus(search_term)}"
+                f"&ssne_untouched={quote_plus(search_term)}"
+                f"&aid={STAYS_AID}"
+                f"&lang={STAYS_LANGUAGE}"
+                f"&dest_id={STAYS_DEST_ID}"
+                f"&dest_type={quote_plus(STAYS_DEST_TYPE)}"
+                f"&group_adults={ADULTS}"
+                f"&no_rooms={ROOMS}"
+                f"&group_children={CHILDREN}"
+                "&order=class"
+            )
         return (
             "https://www.booking.com/searchresults.en-gb.html"
             f"?ss={quote_plus(search_term)}"
@@ -64,6 +86,20 @@ def stays_search_url(search_term: str, catalog_mode: bool) -> str:
 
 def raw_query_for_session(search_term: str, catalog_mode: bool) -> str:
     if catalog_mode:
+        if search_term == STAYS_SEARCH_TERM:
+            return (
+                f"/searchresults.{STAYS_LANGUAGE}.html"
+                f"?aid={STAYS_AID}"
+                f"&ss={quote_plus(search_term)}"
+                f"&ssne={quote_plus(search_term)}"
+                f"&ssne_untouched={quote_plus(search_term)}"
+                f"&lang={STAYS_LANGUAGE}"
+                f"&dest_id={STAYS_DEST_ID}"
+                f"&dest_type={quote_plus(STAYS_DEST_TYPE)}"
+                f"&group_adults={ADULTS}"
+                f"&no_rooms={ROOMS}"
+                f"&group_children={CHILDREN}"
+            )
         return (
             "/searchresults.en-gb.html"
             f"?ss={quote_plus(search_term)}"
@@ -72,16 +108,19 @@ def raw_query_for_session(search_term: str, catalog_mode: bool) -> str:
             "&order=class"
         )
     return (
-        "/searchresults.en-gb.html"
+        f"/searchresults.{STAYS_LANGUAGE}.html"
         f"?ss={quote_plus(search_term)}"
         f"&ssne={quote_plus(search_term)}"
         f"&ssne_untouched={quote_plus(search_term)}"
+        f"&aid={STAYS_AID}"
+        f"&lang={STAYS_LANGUAGE}"
+        f"&dest_id={STAYS_DEST_ID}"
+        f"&dest_type={quote_plus(STAYS_DEST_TYPE)}"
         f"&checkin={CHECKIN}"
         f"&checkout={CHECKOUT}"
         f"&group_adults={ADULTS}"
         f"&no_rooms={ROOMS}"
         f"&group_children={CHILDREN}"
-        "&order=class"
     )
 
 
@@ -219,6 +258,7 @@ def extract_hotel(
     sustainable, certifications = extract_sustainability(item)
 
     return {
+        "source": "booking",
         "hotel_id": basic.get("id"),
         "name": first_nonempty(
             display_name.get("text"),
@@ -596,7 +636,11 @@ async def scrape_hotels_in_context(
         template_body = deepcopy(original_body)
         input_data = template_body.setdefault("variables", {}).setdefault("input", {})
         input_data["doAvailabilityCheck"] = not catalog_mode
-        input_data.setdefault("location", {})["searchString"] = search_term
+        location = input_data.setdefault("location", {})
+        location["searchString"] = search_term
+        if catalog_mode and search_term == STAYS_SEARCH_TERM:
+            location["destType"] = STAYS_DEST_TYPE.upper()
+            location["destId"] = STAYS_DEST_ID
         input_data["filters"] = {}
         if catalog_mode:
             remove_catalog_availability_filters(input_data)
@@ -612,7 +656,8 @@ async def scrape_hotels_in_context(
         print("Starting API pagination...")
         print()
 
-        for page_number in range(max_pages):
+        page_numbers = itertools.count() if max_pages is None else range(max_pages)
+        for page_number in page_numbers:
             offset = page_number * ROWS_PER_PAGE
             page_body = deepcopy(template_body)
             page_input = page_body["variables"]["input"]
@@ -676,10 +721,7 @@ async def scrape_hotels_in_context(
 
     search_terms = CATALOG_SEARCH_TERMS if catalog_mode else [SEARCH_TERM]
     if catalog_mode:
-        print()
-        print("=" * 60)
-        print("COLLECTING ZANZIBAR-WIDE HOTEL CATALOG")
-        print("=" * 60)
+        print_category_header("Booking.com", "Hotels")
         print(f"Catalog search terms: {len(search_terms)}")
         print()
 
@@ -690,7 +732,7 @@ async def scrape_hotels_in_context(
             print("-" * 60)
         await scrape_search_term(search_term)
 
-    print(f"Total unique hotels collected before detail enrichment: {len(all_hotels)}")
+    print_catalog_complete("Hotels", len(all_hotels))
 
     return await enrich_hotels_with_detail_pages(
         context,
