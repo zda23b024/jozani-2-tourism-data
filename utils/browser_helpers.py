@@ -157,6 +157,10 @@ async def launch_context(
         headless=HEADLESS,
         viewport={"width": 1440, "height": 1000},
         locale="en-GB",
+        args=[
+            "--disable-dev-shm-usage",
+            "--no-sandbox",
+        ],
     )
     context._jozani_playwright = playwright
     return context

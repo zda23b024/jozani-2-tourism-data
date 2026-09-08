@@ -1,7 +1,39 @@
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import TextIO
+
+
+NOISY_CONSOLE_PREFIXES = (
+    "Search URL:",
+    "Attractions URL:",
+    "Destination ID:",
+    "Date mode:",
+    "Check-in date:",
+    "Check-out date:",
+    "  request_url:",
+    "  method:",
+    "  operation:",
+    "  query_id:",
+    "  variable_keys:",
+    "  original_pagination:",
+    "  replay_pagination:",
+    "Response Content-Type:",
+)
+
+
+def concise_console_line(message: str) -> bool:
+    if message.strip() == "":
+        return True
+    if "VERBOSE_LOGS" in os.environ and os.environ["VERBOSE_LOGS"].lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        return True
+    return not message.lstrip().startswith(NOISY_CONSOLE_PREFIXES)
 
 
 class TeeStream:
@@ -10,7 +42,8 @@ class TeeStream:
         self.log_file = log_file
 
     def write(self, message: str) -> int:
-        self.console.write(message)
+        if concise_console_line(message):
+            self.console.write(message)
         self.log_file.write(message)
         return len(message)
 

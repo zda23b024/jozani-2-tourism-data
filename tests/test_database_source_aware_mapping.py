@@ -1,9 +1,19 @@
 import unittest
 
+from database.create_tables import bounded_int_value, bounded_numeric_value
 from normalizers.table_builder import build_all_tables
 
 
 class SourceAwareDatabaseMappingTests(unittest.TestCase):
+    def test_bounded_numeric_value_rejects_out_of_range_ratings(self):
+        self.assertEqual(bounded_numeric_value("4.75", 0, 10), 4.75)
+        self.assertIsNone(bounded_numeric_value("456", 0, 10))
+        self.assertIsNone(bounded_numeric_value("-1", 0, 10))
+
+    def test_bounded_int_value_rejects_impossible_review_counts(self):
+        self.assertEqual(bounded_int_value("1200", 0, 1_000_000), 1200)
+        self.assertIsNone(bounded_int_value("33992043", 0, 1_000_000))
+
     def test_tripadvisor_review_metadata_maps_to_source_aware_review_rows(self):
         place = {
             "source": "tripadvisor",

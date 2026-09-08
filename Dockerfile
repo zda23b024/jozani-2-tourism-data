@@ -12,6 +12,11 @@ RUN apt-get update \
         ca-certificates \
         curl \
         postgresql-client \
+        fluxbox \
+        novnc \
+        websockify \
+        x11vnc \
+        xvfb \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

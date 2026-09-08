@@ -57,6 +57,21 @@ def int_value(value: Any) -> int | None:
         return None
 
 
+def bounded_int_value(
+    value: Any,
+    minimum: int | None = None,
+    maximum: int | None = None,
+) -> int | None:
+    number = int_value(value)
+    if number is None:
+        return None
+    if minimum is not None and number < minimum:
+        return None
+    if maximum is not None and number > maximum:
+        return None
+    return number
+
+
 def numeric_value(value: Any) -> float | None:
     if value in (None, ""):
         return None
@@ -64,6 +79,21 @@ def numeric_value(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def bounded_numeric_value(
+    value: Any,
+    minimum: float | None = None,
+    maximum: float | None = None,
+) -> float | None:
+    number = numeric_value(value)
+    if number is None:
+        return None
+    if minimum is not None and number < minimum:
+        return None
+    if maximum is not None and number > maximum:
+        return None
+    return number
 
 
 def time_value(value: Any) -> str | None:
@@ -838,9 +868,9 @@ def upsert_place_source(cursor: Any, row: dict, place_id: int, source_id: int) -
             text_limit(row.get("source_category"), 150),
             numeric_value(row.get("latitude")),
             numeric_value(row.get("longitude")),
-            numeric_value(row.get("star_rating")),
-            numeric_value(row.get("review_score")),
-            int_value(row.get("review_count")) or 0,
+            bounded_numeric_value(row.get("star_rating"), 0, 5),
+            bounded_numeric_value(row.get("review_score"), 0, 10),
+            bounded_int_value(row.get("review_count"), 0, 1_000_000) or 0,
             int_value(row.get("ranking_position")),
             int_value(row.get("ranking_total")),
             row.get("ranking_text"),
@@ -1278,8 +1308,8 @@ def save_to_postgres(tables: dict[str, list[dict]]) -> None:
                         row.get("review_text"),
                         row.get("positive_text"),
                         row.get("negative_text"),
-                        numeric_value(row.get("review_score")),
-                        numeric_value(row.get("rating_scale")),
+                        bounded_numeric_value(row.get("review_score"), 0, 10),
+                        bounded_numeric_value(row.get("rating_scale"), 0, 10),
                         text_limit(row.get("travel_type"), 100),
                         text_limit(row.get("trip_type"), 100),
                         None,
@@ -1316,7 +1346,7 @@ def save_to_postgres(tables: dict[str, list[dict]]) -> None:
 
             for row in tables.get("review_category_scores", []):
                 review_id = review_ids.get(str(row.get("review_id")))
-                score = numeric_value(row.get("score"))
+                score = bounded_numeric_value(row.get("score"), 0, 10)
                 if not review_id or not row.get("category_name") or score is None:
                     continue
                 cursor.execute(
@@ -1333,7 +1363,7 @@ def save_to_postgres(tables: dict[str, list[dict]]) -> None:
                         review_id,
                         text_limit(row.get("category_name"), 100),
                         score,
-                        numeric_value(row.get("rating_scale")),
+                        bounded_numeric_value(row.get("rating_scale"), 0, 10),
                         row.get("created_at"),
                     ),
                 )

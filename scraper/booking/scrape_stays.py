@@ -601,6 +601,23 @@ async def enrich_hotels_with_detail_pages(
         await detail_page.close()
 
 
+def hotel_pagination_stop_reason(
+    reported_total: int | None,
+    offset: int,
+    received: int,
+    added: int,
+    repeated_pages: int,
+    no_progress_pages: int,
+) -> str | None:
+    if received == 0:
+        return "empty"
+    if reported_total is not None and offset + received >= reported_total:
+        return "reported_total"
+    if repeated_pages >= 3 or no_progress_pages >= 3:
+        return "no_progress"
+    return None
+
+
 async def scrape_hotels_in_context(
     context: BrowserContext,
     catalog_mode: bool = False,
@@ -653,6 +670,9 @@ async def scrape_hotels_in_context(
 
         reported_total = None
         term_start_count = len(all_hotels)
+        previous_page_ids: tuple[str, ...] | None = None
+        repeated_pages = 0
+        no_progress_pages = 0
         print("Starting API pagination...")
         print()
 
@@ -705,12 +725,37 @@ async def scrape_hotels_in_context(
                 f"total unique {len(all_hotels)}"
             )
 
-            if reported_total is not None and offset + len(page_hotels) >= reported_total:
+            page_ids = tuple(sorted(hotel_dedupe_key(hotel) for hotel in page_hotels))
+            if page_ids == previous_page_ids:
+                repeated_pages += 1
+            else:
+                repeated_pages = 0
+            previous_page_ids = page_ids
+            if added == 0:
+                no_progress_pages += 1
+            else:
+                no_progress_pages = 0
+
+            stop_reason = hotel_pagination_stop_reason(
+                reported_total,
+                offset,
+                len(page_hotels),
+                added,
+                repeated_pages,
+                no_progress_pages,
+            )
+            if stop_reason == "reported_total":
                 print("Reached the API-reported total.")
                 break
-            if len(page_hotels) < ROWS_PER_PAGE:
-                print(f"The last page contained fewer than {ROWS_PER_PAGE} properties.")
+            if stop_reason == "no_progress":
+                print("WARN Pagination made no progress for three consecutive pages; stopping.")
                 break
+            if len(page_hotels) < ROWS_PER_PAGE:
+                print(
+                    "WARN Short page; API reports more results, continuing."
+                    if reported_total is not None
+                    else "WARN Short page; continuing until the API returns no results."
+                )
             await page.wait_for_timeout(1200)
 
         print(
