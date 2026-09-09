@@ -1660,6 +1660,8 @@ def fetch_known_places_for_reviews(source_code: str) -> tuple[list[dict], list[d
     source_id = source_code.lower()
     hotels: list[dict] = []
     attractions: list[dict] = []
+    attraction_count = 0
+    restaurant_count = 0
 
     try:
         with psycopg.connect(url) as connection:
@@ -1672,6 +1674,7 @@ def fetch_known_places_for_reviews(source_code: str) -> tuple[list[dict], list[d
                         psr.source_url,
                         psr.source_name,
                         psr.source_category,
+                        psr.review_count,
                         psr.raw_json,
                         p.canonical_name,
                         pt.type_group
@@ -1698,6 +1701,7 @@ def fetch_known_places_for_reviews(source_code: str) -> tuple[list[dict], list[d
             source_url,
             source_name,
             source_category,
+            review_count,
             raw_json,
             canonical_name,
             type_group,
@@ -1715,6 +1719,7 @@ def fetch_known_places_for_reviews(source_code: str) -> tuple[list[dict], list[d
             "name": raw.get("name") or source_name or canonical_name,
             "property_url": raw.get("property_url") or source_url,
             "source_place_id": raw.get("source_place_id") or str(source_place_id),
+            "review_count": raw.get("review_count") or review_count,
         }
 
         if type_group == "Accommodation":
@@ -1727,6 +1732,15 @@ def fetch_known_places_for_reviews(source_code: str) -> tuple[list[dict], list[d
             continue
 
         if type_group in {"Attraction", "Activity", "Restaurant"}:
+            if type_group == "Restaurant":
+                place["place_type_id"] = raw.get("place_type_id") or "restaurant"
+                place["restaurant_id"] = raw.get("restaurant_id") or str(source_place_id)
+                restaurant_count += 1
+            else:
+                place["place_type_id"] = raw.get("place_type_id") or (
+                    "boat_tour" if type_group == "Activity" else "historical_site"
+                )
+                attraction_count += 1
             place["attraction_id"] = raw.get("attraction_id") or str(source_place_id)
             if source_id == "tripadvisor":
                 place["tripadvisor_id"] = raw.get("tripadvisor_id") or str(source_place_id)
@@ -1739,7 +1753,8 @@ def fetch_known_places_for_reviews(source_code: str) -> tuple[list[dict], list[d
 
     print(
         f"Known {source_code} places loaded from PostgreSQL: "
-        f"{len(hotels)} hotels, {len(attractions)} attractions"
+        f"{len(hotels)} hotels, {attraction_count} attractions, "
+        f"{restaurant_count} restaurants"
     )
     return hotels, attractions
 

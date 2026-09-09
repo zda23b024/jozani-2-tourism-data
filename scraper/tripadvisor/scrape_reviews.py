@@ -756,6 +756,16 @@ def normalize_graphql_review(raw_review: dict[str, Any], place: dict[str, Any]) 
     return review
 
 
+def parse_review_total_count(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
 def extract_review_page_payload(response_json: Any) -> tuple[int | None, list[dict[str, Any]]]:
     try:
         page_data = (
@@ -771,11 +781,7 @@ def extract_review_page_payload(response_json: Any) -> tuple[int | None, list[di
     reviews = page_payload.get("reviews") or []
     if not isinstance(reviews, list):
         reviews = []
-    total_count = page_payload.get("totalCount")
-    try:
-        total_count = int(total_count) if total_count not in (None, "") else None
-    except (TypeError, ValueError):
-        total_count = None
+    total_count = parse_review_total_count(page_payload.get("totalCount"))
     return total_count, [review for review in reviews if isinstance(review, dict)]
 
 
