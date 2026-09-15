@@ -44,6 +44,7 @@ from scraper.tripadvisor.scrape_stays import (
     parse_float,
     parse_number,
     parse_price,
+    parse_review_count,
     tripadvisor_cookie_value,
     tripadvisor_location_id_from_node,
     valid_tripadvisor_location_id,
@@ -793,10 +794,7 @@ def tripadvisor_catalog_rating(value: Any) -> float | None:
 
 
 def tripadvisor_catalog_review_count(value: Any) -> int | None:
-    text = str(value or "")
-    if not re.search(r"\breviews?\b", text, flags=re.IGNORECASE):
-        return None
-    return parse_number(text)
+    return parse_review_count(value)
 
 
 def normalize_place_card(raw: dict[str, Any], kind: str) -> dict[str, Any] | None:
@@ -818,7 +816,7 @@ def normalize_place_card(raw: dict[str, Any], kind: str) -> dict[str, Any] | Non
         tripadvisor_catalog_rating(text),
     )
     review_count = first_nonempty(
-        raw.get("review_count"),
+        tripadvisor_catalog_review_count(raw.get("review_count")),
         tripadvisor_catalog_review_count(text),
     )
     source_place_id = valid_tripadvisor_location_id(

@@ -159,6 +159,7 @@ async def launch_context(
         locale="en-GB",
         args=[
             "--disable-dev-shm-usage",
+            "--disable-gpu",
             "--no-sandbox",
         ],
     )
@@ -168,6 +169,13 @@ async def launch_context(
 
 async def close_context(context: BrowserContext) -> None:
     playwright = getattr(context, "_jozani_playwright", None)
-    await context.close()
-    if playwright is not None:
-        await playwright.stop()
+    try:
+        await context.close()
+    except Exception as error:
+        print(f"Browser context already disconnected during cleanup: {error}")
+    finally:
+        if playwright is not None:
+            try:
+                await playwright.stop()
+            except Exception as error:
+                print(f"Playwright driver already disconnected during cleanup: {error}")

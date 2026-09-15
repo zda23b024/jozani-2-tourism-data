@@ -23,7 +23,6 @@ from utils.helpers import first_nonempty, limited_rows, safe_filename, stable_re
 
 BOOKING_SOURCE_ID = "booking"
 TRIPADVISOR_SOURCE_ID = "tripadvisor"
-MULTI_SOURCE_ID = "multi"
 DEFAULT_LOCATION_ID = SEARCH_LOCATION_ID
 
 
@@ -240,7 +239,10 @@ def build_scraping_run(now: str, hotels: list[dict], reviews: list[dict], attrac
         for review in reviews
         if review.get("source")
     )
-    source_id = next(iter(run_source_ids)) if len(run_source_ids) == 1 else MULTI_SOURCE_ID
+    if len(run_source_ids) == 1:
+        source_id = next(iter(run_source_ids))
+    else:
+        source_id = BOOKING_SOURCE_ID if BOOKING_SOURCE_ID in run_source_ids else sorted(run_source_ids)[0]
     scraping_run_id = (
         f"{source_id}:{safe_filename(SEARCH_TERM)}:"
         f"{CHECKIN}:{CHECKOUT}:{safe_filename(now)}"

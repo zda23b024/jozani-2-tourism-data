@@ -63,14 +63,11 @@ def print_review_progress(
         print("         Reviews: FAILED")
         print()
         return
-    if reported is None:
-        print(f"         Reviews: {collected or 0}")
-    else:
-        if not isinstance(reported, int) or reported < 0:
-            print(f"         Reviews: {collected or 0}/? UNKNOWN")
-            return
-        status = "OK" if (collected or 0) == reported else "WARN"
-        print(f"         Reviews: {collected or 0}/{reported} {status}")
+    if reported is None or not isinstance(reported, int) or reported < 0:
+        print(f"         Reviews: {collected or 0}/? UNKNOWN")
+        return
+    status = "OK" if (collected or 0) == reported else "WARN"
+    print(f"         Reviews: {collected or 0}/{reported} {status}")
     print()
 
 

@@ -69,6 +69,46 @@ class TripadvisorCatalogParsingTests(unittest.TestCase):
         self.assertIsNone(attraction["review_score"])
         self.assertIsNone(attraction["review_count"])
 
+    def test_tripadvisor_url_geo_id_does_not_become_hotel_review_count(self):
+        hotel = normalize_card(
+            {
+                "name": "Sample Hotel",
+                "url": "https://www.tripadvisor.com/Hotel_Review-g616016-d636698-Reviews-Sample.html",
+                "text": "https://www.tripadvisor.com/Hotel_Review-g616016-d636698-Reviews-Sample.html",
+            }
+        )
+
+        self.assertIsNotNone(hotel)
+        self.assertIsNone(hotel["review_count"])
+
+    def test_tripadvisor_url_geo_id_does_not_become_place_review_count(self):
+        restaurant = normalize_place_card(
+            {
+                "name": "Sample Restaurant",
+                "url": "https://www.tripadvisor.com/Restaurant_Review-g616020-d23818850-Reviews-Sample.html",
+                "location_id": "23818850",
+                "text": "https://www.tripadvisor.com/Restaurant_Review-g616020-d23818850-Reviews-Sample.html",
+            },
+            "restaurants",
+        )
+
+        self.assertIsNotNone(restaurant)
+        self.assertIsNone(restaurant["review_count"])
+
+    def test_labeled_tripadvisor_review_count_is_kept(self):
+        restaurant = normalize_place_card(
+            {
+                "name": "Sample Restaurant",
+                "url": "https://www.tripadvisor.com/Restaurant_Review-g616020-d23818850-Reviews-Sample.html",
+                "location_id": "23818850",
+                "review_count": "1,234 reviews",
+            },
+            "restaurants",
+        )
+
+        self.assertIsNotNone(restaurant)
+        self.assertEqual(restaurant["review_count"], 1234)
+
     def test_review_total_missing_stays_unknown(self):
         total_count, reviews = extract_review_page_payload(
             [

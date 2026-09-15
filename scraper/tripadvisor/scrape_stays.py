@@ -445,6 +445,23 @@ def parse_number(value: Any) -> int | None:
         return None
 
 
+def parse_review_count(value: Any) -> int | None:
+    if isinstance(value, int):
+        return value if value >= 0 else None
+    if isinstance(value, float):
+        return int(value) if value >= 0 and value.is_integer() else None
+    text = str(value or "")
+    patterns = [
+        r"([\d,]+)\s+(?:traveler\s+)?reviews?\b",
+        r"\breviews?\s*[:(]?\s*([\d,]+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return parse_number(match.group(1))
+    return None
+
+
 def parse_float(value: Any) -> float | None:
     if value in (None, ""):
         return None
@@ -720,7 +737,10 @@ def normalize_card(raw: dict[str, Any]) -> dict[str, Any] | None:
     text = clean_text(raw.get("text")) or ""
     price, currency = parse_price(text)
     rating = first_nonempty(raw.get("rating"), parse_float(text))
-    review_count = first_nonempty(raw.get("review_count"), parse_number(text))
+    review_count = first_nonempty(
+        parse_review_count(raw.get("review_count")),
+        parse_review_count(text),
+    )
     tripadvisor_id = valid_tripadvisor_location_id(
         raw.get("location_id")
     ) or tripadvisor_id_from_url(url)

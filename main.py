@@ -3,6 +3,7 @@ import argparse
 
 from config.configuration import (
     BOOKING_BROWSER_PROFILE_DIR,
+    BOOKING_ATTRACTION_REVIEW_PLACE_LIMIT,
     LOG_DIR,
     TRIPADVISOR_BROWSER_PROFILE_DIR,
     ensure_project_dirs,
@@ -41,57 +42,57 @@ from utils.helpers import safe_filename
 from utils.run_logging import RunLogger
 
 
-def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        prog="python main.py",
-        usage="python main.py <source> <mode>",
-        description="Jozani 2.0 Tourism Data Collector",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=(
-            "Sources:\n"
-            "  booking       Booking.com\n"
-            "  tripadvisor   Tripadvisor\n"
-            "  all           Both sources\n\n"
-            "Modes:\n"
-            "  catalog       Collect catalogs only\n"
-            "  reviews       Collect reviews only\n"
-            "  all           Collect catalogs and reviews\n\n"
-            "Examples:\n"
-            "  python main.py booking all\n"
-            "  python main.py tripadvisor catalog\n"
-            "  python main.py all reviews\n"
-            "  python main.py all all"
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Collect tourism data from supported providers.")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--all",
+        action="store_true",
+        help="Build/refresh the full catalog and collect reviews, without saving date-based availability.",
+    )
+    mode.add_argument(
+        "--daily",
+        action="store_true",
+        help="Collect today's date-based prices/availability and new reviews.",
+    )
+    mode.add_argument(
+        "--reviews",
+        action="store_true",
+        help="Load known places from PostgreSQL and collect only new reviews.",
+    )
+    mode.add_argument(
+        "--catalog",
+        action="store_true",
+        help="Refresh hotel and attraction details without reviews or date-based availability.",
+    )
+    parser.add_argument(
+        "--only",
+        choices=["all", "hotels", "attractions", "restaurants"],
+        default="all",
+        help=(
+            "Limit scraping to hotels, attractions, restaurants, or all. "
+            "Without a mode, attractions/restaurants run catalog-only."
         ),
     )
     parser.add_argument(
-        "source",
-        choices=["booking", "tripadvisor", "all"],
-        help="Source to collect.",
+        "--source",
+        choices=["booking", "tripadvisor", "both"],
+        default="both",
+        help="Choose which provider to scrape. Defaults to both.",
     )
-    parser.add_argument(
-        "mode",
-        choices=["catalog", "reviews", "all"],
-        help="Collection mode.",
-    )
-    return parser.parse_args(argv)
+    return parser.parse_args()
 
 
-def print_run_header(source: str, mode: str) -> None:
-    source_label = {
-        "booking": "Booking.com",
-        "tripadvisor": "Tripadvisor",
-        "all": "Booking.com + Tripadvisor",
-    }[source]
-    mode_label = {
-        "catalog": "Catalog",
-        "reviews": "Reviews",
-        "all": "Catalog + Reviews",
-    }[mode]
-    print("=" * 60)
-    print("JOZANI 2.0")
-    print(f"Source: {source_label}")
-    print(f"Mode: {mode_label}")
-    print("=" * 60)
+def selected_mode(args: argparse.Namespace) -> str:
+    if args.all:
+        return "all"
+    if args.reviews:
+        return "reviews"
+    if args.catalog:
+        return "catalog"
+    if args.only in {"attractions", "restaurants"}:
+        return "catalog"
+    return "daily"
 
 
 def is_tripadvisor_restaurant(place: dict) -> bool:
@@ -106,11 +107,14 @@ def is_tripadvisor_attraction(place: dict) -> bool:
 
 
 def reviews_for_places(reviews: list[dict], places: list[dict]) -> int:
-    place_source_ids = {
-        str(place.get("place_source_id") or "")
-        for place in places
-        if place.get("place_source_id")
-    }
+    place_source_ids: set[str] = set()
+    for place in places:
+        place_source_id = place.get("place_source_id")
+        if place_source_id:
+            place_source_ids.add(str(place_source_id))
+            continue
+        if str(place.get("source") or "").lower() == "booking" and place.get("attraction_id"):
+            place_source_ids.add(attraction_place_source_id(attraction_source_place_id(place)))
     return sum(
         1
         for review in reviews
@@ -123,6 +127,29 @@ def reviewable_attraction_place_source_ids(attractions: list[dict]) -> list[str]
         attraction_place_source_id(attraction_source_place_id(attraction))
         for attraction in attractions
     ]
+
+
+def booking_attraction_review_places_processed(attractions: list[dict]) -> int:
+    reviewable_attractions = [
+        attraction
+        for attraction in attractions
+        if attraction.get("property_url")
+    ]
+    if BOOKING_ATTRACTION_REVIEW_PLACE_LIMIT is not None:
+        reviewable_attractions = reviewable_attractions[:BOOKING_ATTRACTION_REVIEW_PLACE_LIMIT]
+    return len(reviewable_attractions)
+
+
+def print_booking_attraction_review_summary(
+    attractions_processed: int,
+    reviews_collected: int,
+) -> None:
+    print()
+    print("=" * 60)
+    print("BOOKING.COM ATTRACTION REVIEWS COMPLETE")
+    print(f"Attractions processed: {attractions_processed}")
+    print(f"Reviews collected: {reviews_collected}")
+    print("=" * 60)
 
 
 async def collect_reviews(
@@ -163,11 +190,11 @@ async def collect_reviews(
 
 
 def should_run_booking(source: str) -> bool:
-    return source in {"booking", "all", "both"}
+    return source in {"booking", "both"}
 
 
 def should_run_tripadvisor(source: str) -> bool:
-    return source in {"tripadvisor", "all", "both"}
+    return source in {"tripadvisor", "both"}
 
 
 def hotel_duplicate_key(hotel: dict) -> str:
@@ -334,7 +361,12 @@ async def main(mode: str = "daily", only: str = "all", source: str = "both") -> 
                 if mode != "catalog"
                 else None,
             )
-        if only in {"all", "attractions"}:
+        if mode == "reviews" and only == "attractions":
+            print_booking_attraction_review_summary(
+                booking_attraction_review_places_processed(booking_attractions),
+                len(booking_reviews),
+            )
+        elif only in {"all", "attractions"}:
             print_category_summary(
                 "Booking.com",
                 "Attractions",
@@ -475,7 +507,7 @@ async def main(mode: str = "daily", only: str = "all", source: str = "both") -> 
     )
     tables = save_all_table_outputs(tables)
     save_to_postgres(tables)
-    if source in {"all", "both"}:
+    if source == "both":
         print_overall_summary(
             {
                 "hotels": len(
@@ -530,7 +562,6 @@ async def main(mode: str = "daily", only: str = "all", source: str = "both") -> 
 if __name__ == "__main__":
     ensure_project_dirs()
     args = parse_args()
-    print_run_header(args.source, args.mode)
-    with RunLogger(LOG_DIR) as log_path:
-        asyncio.run(main(args.mode, source=args.source))
+    with RunLogger(LOG_DIR, source=args.source) as log_path:
+        asyncio.run(main(selected_mode(args), args.only, args.source))
         print(f"Completed run. Log saved to: {log_path}")

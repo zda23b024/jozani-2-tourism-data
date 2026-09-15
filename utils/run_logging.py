@@ -1,39 +1,7 @@
-import os
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import TextIO
-
-
-NOISY_CONSOLE_PREFIXES = (
-    "Search URL:",
-    "Attractions URL:",
-    "Destination ID:",
-    "Date mode:",
-    "Check-in date:",
-    "Check-out date:",
-    "  request_url:",
-    "  method:",
-    "  operation:",
-    "  query_id:",
-    "  variable_keys:",
-    "  original_pagination:",
-    "  replay_pagination:",
-    "Response Content-Type:",
-)
-
-
-def concise_console_line(message: str) -> bool:
-    if message.strip() == "":
-        return True
-    if "VERBOSE_LOGS" in os.environ and os.environ["VERBOSE_LOGS"].lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
-        return True
-    return not message.lstrip().startswith(NOISY_CONSOLE_PREFIXES)
 
 
 class TeeStream:
@@ -42,8 +10,7 @@ class TeeStream:
         self.log_file = log_file
 
     def write(self, message: str) -> int:
-        if concise_console_line(message):
-            self.console.write(message)
+        self.console.write(message)
         self.log_file.write(message)
         return len(message)
 
@@ -52,10 +19,19 @@ class TeeStream:
         self.log_file.flush()
 
 
+def run_log_prefix(source: str | None) -> str:
+    normalized = str(source or "").strip().lower()
+    if normalized == "booking":
+        return "booking"
+    if normalized == "tripadvisor":
+        return "tripadvisor"
+    return "jozani"
+
+
 class RunLogger:
-    def __init__(self, log_dir: Path) -> None:
+    def __init__(self, log_dir: Path, source: str | None = None) -> None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_path = log_dir / f"booking_run_{timestamp}.log"
+        self.log_path = log_dir / f"{run_log_prefix(source)}_run_{timestamp}.log"
         self._log_file: TextIO | None = None
         self._stdout: TextIO | None = None
         self._stderr: TextIO | None = None

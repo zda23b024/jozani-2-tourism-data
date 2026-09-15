@@ -8,6 +8,9 @@ from db import query_dataframe, query_one
 
 
 RUNNING_STATUSES = ("running", "started", "collecting", "in_progress")
+SUCCESS_STATUSES = ("success", "completed", "complete")
+FAILED_STATUSES = ("failed", "error")
+WARNING_STATUSES = ("partial", "warning", "warn")
 
 
 @dataclass(frozen=True)
@@ -30,20 +33,41 @@ def _category_filter(category: str, alias: str = "pt") -> tuple[str, list]:
     return f" AND {alias}.type_group = %s", [category]
 
 
-def kpis(filters: Filters) -> dict:
+def _search_filter(search: str, columns: list[str]) -> tuple[str, list]:
+    clean = search.strip()
+    if not clean:
+        return "", []
+    clause = " OR ".join(f"{column} ILIKE %s" for column in columns)
+    return f" AND ({clause})", [f"%{clean}%"] * len(columns)
+
+
+def connection_status() -> dict:
+    return query_one(
+        """
+        SELECT
+            current_database() AS database_name,
+            current_user AS database_user,
+            NOW() AS checked_at,
+            split_part(version(), ' on ', 1) AS server_version
+        """
+    )
+
+
+def overview_kpis(filters: Filters) -> dict:
     source_sql, source_params = _source_filter(filters.source)
     category_sql, category_params = _category_filter(filters.category)
     params = tuple(source_params + category_params)
-    data = query_one(
+    values = query_one(
         f"""
         SELECT
-            COUNT(DISTINCT p.place_id)::bigint AS total_places,
+            COUNT(DISTINCT p.place_id)::bigint AS canonical_places,
+            COUNT(DISTINCT psr.place_source_id)::bigint AS source_records,
             COUNT(DISTINCT r.review_id)::bigint AS total_reviews,
-            COUNT(DISTINCT s.source_id)::bigint AS total_sources,
-            COALESCE(MAX(GREATEST(
-                COALESCE(psr.updated_at, 'epoch'::timestamptz),
-                COALESCE(r.created_at, 'epoch'::timestamptz)
-            )), NULL) AS last_data_update
+            COUNT(DISTINCT r.review_id) FILTER (
+                WHERE COALESCE(NULLIF(TRIM(r.review_text), ''), NULLIF(TRIM(r.positive_text), ''), NULLIF(TRIM(r.negative_text), '')) IS NOT NULL
+            )::bigint AS reviews_with_text,
+            COUNT(DISTINCT s.source_id) FILTER (WHERE psr.place_source_id IS NOT NULL)::bigint AS active_sources,
+            MAX(COALESCE(psr.last_scraped_at, psr.updated_at, r.created_at, p.updated_at)) AS latest_database_update
         FROM places p
         JOIN place_types pt ON pt.place_type_id = p.place_type_id
         LEFT JOIN place_source_records psr ON psr.place_id = p.place_id
@@ -55,6 +79,15 @@ def kpis(filters: Filters) -> dict:
         """,
         params,
     )
+    run = query_one(
+        """
+        SELECT MAX(completed_at) AS last_successful_collection
+        FROM scraping_runs
+        WHERE LOWER(status) = ANY(%s)
+          AND completed_at IS NOT NULL
+        """,
+        (list(SUCCESS_STATUSES),),
+    )
     running = query_one(
         """
         SELECT COUNT(*)::bigint AS active_jobs
@@ -64,61 +97,63 @@ def kpis(filters: Filters) -> dict:
         """,
         (list(RUNNING_STATUSES),),
     )
-    return {**data, **running}
+    return {**values, **run, **running}
 
 
-def source_overview() -> pd.DataFrame:
+def source_coverage() -> pd.DataFrame:
     return query_dataframe(
         """
         SELECT
-            s.source_code,
-            s.source_name,
-            COUNT(DISTINCT psr.place_source_id)::bigint AS source_listings,
-            COUNT(DISTINCT p.place_id)::bigint AS canonical_places,
-            COUNT(DISTINCT r.review_id)::bigint AS reviews,
-            COUNT(DISTINCT psr.place_source_id) FILTER (WHERE pt.type_group = 'Accommodation')::bigint AS accommodations,
+            s.source_code AS source,
+            COUNT(DISTINCT psr.place_source_id) FILTER (WHERE pt.type_group = 'Accommodation')::bigint AS accommodations_hotels,
             COUNT(DISTINCT psr.place_source_id) FILTER (WHERE pt.type_group IN ('Attraction', 'Activity'))::bigint AS attractions,
             COUNT(DISTINCT psr.place_source_id) FILTER (WHERE pt.type_group = 'Restaurant')::bigint AS restaurants,
-            ROUND(AVG(psr.review_score)::numeric, 2) AS average_rating,
-            MAX(COALESCE(psr.last_scraped_at, psr.updated_at, psr.created_at)) AS latest_collection_time
+            COUNT(DISTINCT r.review_id)::bigint AS reviews,
+            MAX(COALESCE(psr.last_scraped_at, psr.updated_at, r.created_at)) AS last_update
         FROM sources s
         LEFT JOIN place_source_records psr ON psr.source_id = s.source_id
         LEFT JOIN places p ON p.place_id = psr.place_id
         LEFT JOIN place_types pt ON pt.place_type_id = p.place_type_id
         LEFT JOIN reviews r ON r.place_source_id = psr.place_source_id
-        GROUP BY s.source_id, s.source_code, s.source_name
+        GROUP BY s.source_code
         ORDER BY s.source_code
         """
     )
 
 
-def latest_run() -> dict:
-    return query_one(
-        """
+def places_by_source_category(filters: Filters) -> pd.DataFrame:
+    source_sql, source_params = _source_filter(filters.source)
+    category_sql, category_params = _category_filter(filters.category)
+    return query_dataframe(
+        f"""
         SELECT
-            sr.scraping_run_id,
+            s.source_code AS source,
+            CASE
+                WHEN pt.type_group = 'Accommodation' THEN 'Accommodations / Hotels'
+                WHEN pt.type_group IN ('Attraction', 'Activity') THEN 'Attractions'
+                WHEN pt.type_group = 'Restaurant' THEN 'Restaurants'
+                ELSE pt.type_group
+            END AS category,
+            COUNT(DISTINCT psr.place_source_id)::bigint AS source_records,
+            COUNT(DISTINCT p.place_id)::bigint AS canonical_places
+        FROM place_source_records psr
+        JOIN sources s ON s.source_id = psr.source_id
+        JOIN places p ON p.place_id = psr.place_id
+        JOIN place_types pt ON pt.place_type_id = p.place_type_id
+        WHERE 1 = 1
+          {source_sql}
+          {category_sql}
+        GROUP BY
             s.source_code,
-            s.source_name,
-            sr.entity_type,
-            sr.run_type,
-            sr.status,
-            sr.started_at,
-            sr.completed_at,
-            sr.records_found,
-            sr.records_new,
-            sr.records_updated,
-            sr.pages_total,
-            COALESCE(sr.pages_successful, sr.pages_success) AS pages_successful,
-            sr.pages_failed,
-            sr.stop_reason
-        FROM scraping_runs sr
-        JOIN sources s ON s.source_id = sr.source_id
-        ORDER BY
-            CASE WHEN LOWER(sr.status) = ANY(%s) AND sr.completed_at IS NULL THEN 0 ELSE 1 END,
-            sr.started_at DESC
-        LIMIT 1
+            CASE
+                WHEN pt.type_group = 'Accommodation' THEN 'Accommodations / Hotels'
+                WHEN pt.type_group IN ('Attraction', 'Activity') THEN 'Attractions'
+                WHEN pt.type_group = 'Restaurant' THEN 'Restaurants'
+                ELSE pt.type_group
+            END
+        ORDER BY source_records DESC, source, category
         """,
-        (list(RUNNING_STATUSES),),
+        tuple(source_params + category_params),
     )
 
 
@@ -142,161 +177,385 @@ def reviews_over_time(days: int | None) -> pd.DataFrame:
     )
 
 
-def reviews_by_source() -> pd.DataFrame:
-    return query_dataframe(
-        """
-        SELECT
-            s.source_code,
-            COUNT(r.review_id)::bigint AS reviews
-        FROM sources s
-        LEFT JOIN place_source_records psr ON psr.source_id = s.source_id
-        LEFT JOIN reviews r ON r.place_source_id = psr.place_source_id
-        GROUP BY s.source_code
-        ORDER BY reviews DESC, s.source_code
-        """
-    )
-
-
-def places_by_category(filters: Filters) -> pd.DataFrame:
-    source_sql, source_params = _source_filter(filters.source)
-    return query_dataframe(
-        f"""
-        SELECT
-            pt.type_group AS category,
-            COUNT(DISTINCT p.place_id)::bigint AS canonical_places
-        FROM places p
-        JOIN place_types pt ON pt.place_type_id = p.place_type_id
-        LEFT JOIN place_source_records psr ON psr.place_id = p.place_id
-        LEFT JOIN sources s ON s.source_id = psr.source_id
-        WHERE 1 = 1
-          {source_sql}
-        GROUP BY pt.type_group
-        ORDER BY canonical_places DESC, category
-        """,
-        tuple(source_params),
-    )
-
-
 def top_reviewed_places(filters: Filters, limit: int = 10) -> pd.DataFrame:
     source_sql, source_params = _source_filter(filters.source)
     category_sql, category_params = _category_filter(filters.category)
-    params = tuple(source_params + category_params + [limit])
     return query_dataframe(
         f"""
-        SELECT
-            COALESCE(psr.source_name, p.canonical_name) AS place,
-            pt.type_group AS category,
-            s.source_code AS source,
-            CASE
-                WHEN psr.review_count BETWEEN 0 AND 1000000 THEN psr.review_count
-                ELSE NULL
-            END AS review_count,
-            psr.review_score AS rating
-        FROM place_source_records psr
-        JOIN sources s ON s.source_id = psr.source_id
-        JOIN places p ON p.place_id = psr.place_id
-        JOIN place_types pt ON pt.place_type_id = p.place_type_id
-        WHERE 1 = 1
-          {source_sql}
-          {category_sql}
-        ORDER BY
-            CASE
-                WHEN psr.review_count BETWEEN 0 AND 1000000 THEN psr.review_count
-                ELSE 0
-            END DESC,
-            psr.review_score DESC NULLS LAST
-        LIMIT %s
-        """,
-        params,
-    )
-
-
-def rating_distribution_by_source() -> pd.DataFrame:
-    return query_dataframe(
-        """
-        SELECT
-            s.source_code,
-            CASE
-                WHEN r.rating_scale IS NOT NULL AND r.rating_scale > 0
-                    THEN ROUND((r.review_score / r.rating_scale * 5)::numeric, 1)
-                WHEN s.source_code = 'BOOKING' AND r.review_score IS NOT NULL
-                    THEN ROUND((r.review_score / 10 * 5)::numeric, 1)
-                ELSE ROUND(r.review_score::numeric, 1)
-            END AS normalized_rating_5,
-            COUNT(*)::bigint AS reviews
-        FROM reviews r
-        JOIN place_source_records psr ON psr.place_source_id = r.place_source_id
-        JOIN sources s ON s.source_id = psr.source_id
-        WHERE r.review_score IS NOT NULL
-        GROUP BY s.source_code, normalized_rating_5
-        ORDER BY s.source_code, normalized_rating_5
-        """
-    )
-
-
-def review_languages(limit: int = 8) -> pd.DataFrame:
-    return query_dataframe(
-        """
-        WITH ranked AS (
+        WITH grouped AS (
             SELECT
-                COALESCE(NULLIF(language_code, ''), 'Unknown') AS language,
-                COUNT(*)::bigint AS reviews,
-                ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) AS rank
-            FROM reviews
-            GROUP BY COALESCE(NULLIF(language_code, ''), 'Unknown')
-        ),
-        bucketed AS (
-            SELECT
-                CASE WHEN rank <= %s THEN language ELSE 'Other' END AS language,
-                reviews
-            FROM ranked
+                COALESCE(psr.source_name, p.canonical_name) AS place,
+                pt.type_group AS category,
+                s.source_code AS source,
+                COUNT(r.review_id)::bigint AS stored_reviews,
+                psr.review_score AS source_rating,
+                CASE
+                    WHEN s.source_code = 'BOOKING' AND psr.review_score IS NOT NULL THEN psr.review_score::text || ' / 10'
+                    WHEN s.source_code = 'TRIPADVISOR' AND psr.review_score IS NOT NULL THEN psr.review_score::text || ' / 5'
+                    WHEN psr.review_score IS NOT NULL THEN psr.review_score::text
+                    ELSE NULL
+                END AS rating
+            FROM place_source_records psr
+            JOIN sources s ON s.source_id = psr.source_id
+            JOIN places p ON p.place_id = psr.place_id
+            JOIN place_types pt ON pt.place_type_id = p.place_type_id
+            LEFT JOIN reviews r ON r.place_source_id = psr.place_source_id
+            WHERE 1 = 1
+              {source_sql}
+              {category_sql}
+            GROUP BY psr.place_source_id, p.canonical_name, pt.type_group, s.source_code, psr.source_name, psr.review_score
+            HAVING COUNT(r.review_id) > 0
         )
         SELECT
-            language,
-            SUM(reviews)::bigint AS reviews
-        FROM bucketed
-        GROUP BY language
-        ORDER BY reviews DESC, language
+            ROW_NUMBER() OVER (ORDER BY stored_reviews DESC, source_rating DESC NULLS LAST, place) AS "#",
+            place AS "Place",
+            category AS "Category",
+            source AS "Source",
+            stored_reviews AS "Stored Reviews",
+            rating AS "Rating"
+        FROM grouped
+        ORDER BY stored_reviews DESC, source_rating DESC NULLS LAST, place
+        LIMIT %s
+        """,
+        tuple(source_params + category_params + [limit]),
+    )
+
+
+def recent_runs(limit: int = 6) -> pd.DataFrame:
+    return query_dataframe(
+        """
+        WITH review_totals AS (
+            SELECT
+                s.source_id,
+                COUNT(r.review_id)::bigint AS reviews
+            FROM sources s
+            LEFT JOIN place_source_records psr ON psr.source_id = s.source_id
+            LEFT JOIN reviews r ON r.place_source_id = psr.place_source_id
+            GROUP BY s.source_id
+        ),
+        log_errors AS (
+            SELECT
+                scraping_run_id,
+                MAX(NULLIF(error_message, '')) AS last_error
+            FROM scraping_logs
+            GROUP BY scraping_run_id
+        )
+        SELECT
+            s.source_code AS source,
+            sr.entity_type AS category,
+            sr.started_at AS started,
+            sr.status,
+            COALESCE(sr.records_found, sr.records_new, sr.records_updated, 0) AS records,
+            COALESCE(rt.reviews, 0) AS reviews,
+            COALESCE(sr.stop_reason, le.last_error, 'Recorded run') AS message
+        FROM scraping_runs sr
+        JOIN sources s ON s.source_id = sr.source_id
+        LEFT JOIN review_totals rt ON rt.source_id = s.source_id
+        LEFT JOIN log_errors le ON le.scraping_run_id = sr.scraping_run_id
+        ORDER BY sr.started_at DESC
+        LIMIT %s
         """,
         (limit,),
     )
 
 
-def latest_runs(filters: Filters, limit: int = 30) -> pd.DataFrame:
-    clauses = []
+def explorer_places(
+    source: str = "All",
+    category: str = "All",
+    search: str = "",
+    limit: int = 100,
+    offset: int = 0,
+) -> pd.DataFrame:
+    source_sql, source_params = _source_filter(source)
+    category_sql, category_params = _category_filter(category)
+    search_sql, search_params = _search_filter(
+        search,
+        ["COALESCE(psr.source_name, p.canonical_name)", "COALESCE(l.location_name, '')"],
+    )
+    return query_dataframe(
+        f"""
+        SELECT
+            COALESCE(psr.source_name, p.canonical_name) AS place_name,
+            pt.type_group AS category,
+            s.source_code AS source,
+            COALESCE(l.location_name, l.region_name, l.district_name, '') AS location,
+            psr.review_score AS rating,
+            psr.review_count,
+            COALESCE(psr.last_scraped_at, psr.updated_at, psr.created_at) AS last_updated
+        FROM place_source_records psr
+        JOIN sources s ON s.source_id = psr.source_id
+        JOIN places p ON p.place_id = psr.place_id
+        JOIN place_types pt ON pt.place_type_id = p.place_type_id
+        LEFT JOIN locations l ON l.location_id = p.location_id
+        WHERE 1 = 1
+          {source_sql}
+          {category_sql}
+          {search_sql}
+        ORDER BY last_updated DESC NULLS LAST, place_name
+        LIMIT %s OFFSET %s
+        """,
+        tuple(source_params + category_params + search_params + [limit, offset]),
+    )
+
+
+def explorer_count(source: str = "All", category: str = "All", search: str = "") -> dict:
+    source_sql, source_params = _source_filter(source)
+    category_sql, category_params = _category_filter(category)
+    search_sql, search_params = _search_filter(
+        search,
+        ["COALESCE(psr.source_name, p.canonical_name)", "COALESCE(l.location_name, '')"],
+    )
+    return query_one(
+        f"""
+        SELECT COUNT(*)::bigint AS records
+        FROM place_source_records psr
+        JOIN sources s ON s.source_id = psr.source_id
+        JOIN places p ON p.place_id = psr.place_id
+        JOIN place_types pt ON pt.place_type_id = p.place_type_id
+        LEFT JOIN locations l ON l.location_id = p.location_id
+        WHERE 1 = 1
+          {source_sql}
+          {category_sql}
+          {search_sql}
+        """,
+        tuple(source_params + category_params + search_params),
+    )
+
+
+def review_metrics() -> dict:
+    return query_one(
+        """
+        SELECT
+            COUNT(*)::bigint AS total_reviews,
+            COUNT(*) FILTER (
+                WHERE COALESCE(NULLIF(TRIM(review_text), ''), NULLIF(TRIM(positive_text), ''), NULLIF(TRIM(negative_text), '')) IS NOT NULL
+            )::bigint AS reviews_with_text,
+            COUNT(DISTINCT NULLIF(language_code, ''))::bigint AS languages,
+            COUNT(DISTINCT reviewer_id) FILTER (WHERE reviewer_id IS NOT NULL)::bigint AS reviewers,
+            COUNT(*) FILTER (WHERE review_score IS NOT NULL)::bigint AS reviews_with_rating
+        FROM reviews
+        """
+    )
+
+
+def review_language_options() -> list[str]:
+    frame = query_dataframe(
+        """
+        SELECT DISTINCT COALESCE(NULLIF(language_code, ''), 'Unknown') AS language
+        FROM reviews
+        ORDER BY language
+        """
+    )
+    return ["All"] + frame.get("language", pd.Series(dtype=str)).dropna().tolist()
+
+
+def sample_reviews(
+    source: str = "All",
+    category: str = "All",
+    place_search: str = "",
+    language: str = "All",
+    rating_min: float | None = None,
+    rating_max: float | None = None,
+    limit: int = 50,
+    offset: int = 0,
+) -> pd.DataFrame:
+    clauses: list[str] = []
+    params: list = []
+    if source != "All":
+        clauses.append("s.source_code = %s")
+        params.append(source)
+    if category != "All":
+        clauses.append("pt.type_group = %s")
+        params.append(category)
+    if place_search.strip():
+        clauses.append("COALESCE(psr.source_name, p.canonical_name) ILIKE %s")
+        params.append(f"%{place_search.strip()}%")
+    if language != "All":
+        if language == "Unknown":
+            clauses.append("(r.language_code IS NULL OR r.language_code = '')")
+        else:
+            clauses.append("r.language_code = %s")
+            params.append(language)
+    if rating_min is not None:
+        clauses.append("r.review_score >= %s")
+        params.append(rating_min)
+    if rating_max is not None:
+        clauses.append("r.review_score <= %s")
+        params.append(rating_max)
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+    params.extend([limit, offset])
+    return query_dataframe(
+        f"""
+        SELECT
+            COALESCE(psr.source_name, p.canonical_name) AS place,
+            s.source_code AS source,
+            pt.type_group AS category,
+            r.review_score AS rating,
+            r.rating_scale,
+            r.review_date,
+            COALESCE(NULLIF(r.language_code, ''), 'Unknown') AS language,
+            COALESCE(NULLIF(rv.reviewer_name, ''), NULLIF(rv.username, ''), 'Unknown') AS reviewer,
+            rv.country_name AS reviewer_country,
+            r.review_title,
+            COALESCE(NULLIF(r.review_text, ''), NULLIF(r.positive_text, ''), NULLIF(r.negative_text, '')) AS review_text
+        FROM reviews r
+        JOIN place_source_records psr ON psr.place_source_id = r.place_source_id
+        JOIN sources s ON s.source_id = psr.source_id
+        JOIN places p ON p.place_id = psr.place_id
+        JOIN place_types pt ON pt.place_type_id = p.place_type_id
+        LEFT JOIN reviewers rv ON rv.reviewer_id = r.reviewer_id
+        {where}
+        ORDER BY r.review_date DESC NULLS LAST, r.created_at DESC
+        LIMIT %s OFFSET %s
+        """,
+        tuple(params),
+    )
+
+
+def sample_reviews_count(
+    source: str = "All",
+    category: str = "All",
+    place_search: str = "",
+    language: str = "All",
+    rating_min: float | None = None,
+    rating_max: float | None = None,
+) -> dict:
+    clauses: list[str] = []
+    params: list = []
+    if source != "All":
+        clauses.append("s.source_code = %s")
+        params.append(source)
+    if category != "All":
+        clauses.append("pt.type_group = %s")
+        params.append(category)
+    if place_search.strip():
+        clauses.append("COALESCE(psr.source_name, p.canonical_name) ILIKE %s")
+        params.append(f"%{place_search.strip()}%")
+    if language != "All":
+        if language == "Unknown":
+            clauses.append("(r.language_code IS NULL OR r.language_code = '')")
+        else:
+            clauses.append("r.language_code = %s")
+            params.append(language)
+    if rating_min is not None:
+        clauses.append("r.review_score >= %s")
+        params.append(rating_min)
+    if rating_max is not None:
+        clauses.append("r.review_score <= %s")
+        params.append(rating_max)
+    where = "WHERE " + " AND ".join(clauses) if clauses else ""
+    return query_one(
+        f"""
+        SELECT COUNT(*)::bigint AS records
+        FROM reviews r
+        JOIN place_source_records psr ON psr.place_source_id = r.place_source_id
+        JOIN sources s ON s.source_id = psr.source_id
+        JOIN places p ON p.place_id = psr.place_id
+        JOIN place_types pt ON pt.place_type_id = p.place_type_id
+        {where}
+        """,
+        tuple(params),
+    )
+
+
+def health_summary() -> dict:
+    return query_one(
+        """
+        SELECT
+            MAX(completed_at) FILTER (WHERE LOWER(status) = ANY(%s)) AS last_successful_run,
+            MAX(started_at) FILTER (WHERE LOWER(status) = ANY(%s)) AS last_failed_run,
+            COUNT(*) FILTER (WHERE LOWER(status) = ANY(%s))::bigint AS successful_runs,
+            COUNT(*) FILTER (WHERE LOWER(status) = ANY(%s))::bigint AS failed_runs,
+            COUNT(*) FILTER (WHERE LOWER(status) = ANY(%s) AND completed_at IS NULL)::bigint AS running_jobs
+        FROM scraping_runs
+        """,
+        (
+            list(SUCCESS_STATUSES),
+            list(FAILED_STATUSES),
+            list(SUCCESS_STATUSES),
+            list(FAILED_STATUSES),
+            list(RUNNING_STATUSES),
+        ),
+    )
+
+
+def collection_status_by_source() -> pd.DataFrame:
+    return query_dataframe(
+        """
+        WITH latest AS (
+            SELECT
+                s.source_code AS source,
+                COALESCE(sr.entity_type, sr.run_type) AS category,
+                sr.status,
+                sr.started_at,
+                sr.completed_at,
+                sr.stop_reason,
+                ROW_NUMBER() OVER (
+                    PARTITION BY s.source_code, COALESCE(sr.entity_type, sr.run_type)
+                    ORDER BY sr.started_at DESC
+                ) AS rn
+            FROM scraping_runs sr
+            JOIN sources s ON s.source_id = sr.source_id
+        )
+        SELECT
+            source,
+            category,
+            status,
+            started_at AS last_run,
+            completed_at,
+            stop_reason
+        FROM latest
+        WHERE rn = 1
+        ORDER BY source, category
+        """
+    )
+
+
+def collection_health(filters: Filters, limit: int = 80) -> pd.DataFrame:
+    clauses: list[str] = []
     params: list = []
     if filters.source != "All":
         clauses.append("s.source_code = %s")
         params.append(filters.source)
-    if filters.run_status != "All":
-        clauses.append("UPPER(sr.status) = %s")
-        params.append(filters.run_status.upper())
     if filters.category != "All":
         clauses.append("sr.entity_type = %s")
         params.append(filters.category)
+    if filters.run_status != "All":
+        clauses.append("UPPER(sr.status) = %s")
+        params.append(filters.run_status.upper())
     where = "WHERE " + " AND ".join(clauses) if clauses else ""
     params.append(limit)
     return query_dataframe(
         f"""
+        WITH log_errors AS (
+            SELECT
+                scraping_run_id,
+                COUNT(*) FILTER (WHERE COALESCE(error_message, '') <> '' OR UPPER(log_level) IN ('ERROR', 'FAILED')) AS error_logs,
+                MAX(NULLIF(error_message, '')) AS last_error
+            FROM scraping_logs
+            GROUP BY scraping_run_id
+        )
         SELECT
-            sr.started_at,
             s.source_code AS source,
-            sr.entity_type,
+            sr.entity_type AS category,
             sr.run_type,
             sr.status,
+            sr.started_at AS last_run,
             sr.completed_at,
             sr.records_found,
             sr.records_new,
             sr.records_updated,
             COALESCE(sr.pages_successful, sr.pages_success) AS pages_successful,
             sr.pages_failed,
-            sr.stop_reason,
+            sr.errors_count,
             CASE
                 WHEN sr.completed_at IS NULL THEN NULL
                 ELSE EXTRACT(EPOCH FROM (sr.completed_at - sr.started_at))::bigint
-            END AS duration_seconds
+            END AS duration_seconds,
+            COALESCE(sr.stop_reason, le.last_error) AS error_summary
         FROM scraping_runs sr
         JOIN sources s ON s.source_id = sr.source_id
+        LEFT JOIN log_errors le ON le.scraping_run_id = sr.scraping_run_id
         {where}
         ORDER BY sr.started_at DESC
         LIMIT %s
@@ -305,126 +564,114 @@ def latest_runs(filters: Filters, limit: int = 30) -> pd.DataFrame:
     )
 
 
+def database_summary() -> dict:
+    return query_one(
+        """
+        SELECT
+            (SELECT COUNT(*)::bigint FROM sources) AS sources,
+            (SELECT COUNT(*)::bigint FROM places) AS canonical_places,
+            (SELECT COUNT(*)::bigint FROM place_source_records) AS source_records,
+            (SELECT COUNT(*)::bigint FROM reviews) AS reviews,
+            (SELECT COUNT(*)::bigint FROM reviewers) AS reviewers,
+            (SELECT COUNT(*)::bigint FROM places p JOIN place_types pt ON pt.place_type_id = p.place_type_id WHERE pt.type_group = 'Accommodation') AS accommodations,
+            (SELECT COUNT(*)::bigint FROM places p JOIN place_types pt ON pt.place_type_id = p.place_type_id WHERE pt.type_group IN ('Attraction', 'Activity')) AS attractions,
+            (SELECT COUNT(*)::bigint FROM places p JOIN place_types pt ON pt.place_type_id = p.place_type_id WHERE pt.type_group = 'Restaurant') AS restaurants,
+            GREATEST(
+                COALESCE((SELECT MAX(updated_at) FROM places), 'epoch'::timestamptz),
+                COALESCE((SELECT MAX(updated_at) FROM place_source_records), 'epoch'::timestamptz),
+                COALESCE((SELECT MAX(updated_at) FROM reviews), 'epoch'::timestamptz)
+            ) AS latest_database_update
+        """
+    )
+
+
+def entity_counts() -> pd.DataFrame:
+    return query_dataframe(
+        """
+        SELECT 'sources' AS entity, COUNT(*)::bigint AS records FROM sources
+        UNION ALL SELECT 'places', COUNT(*)::bigint FROM places
+        UNION ALL SELECT 'place_source_records', COUNT(*)::bigint FROM place_source_records
+        UNION ALL SELECT 'accommodation_source_details', COUNT(*)::bigint FROM accommodation_source_details
+        UNION ALL SELECT 'attraction_source_details', COUNT(*)::bigint FROM attraction_source_details
+        UNION ALL SELECT 'restaurant_source_details', COUNT(*)::bigint FROM restaurant_source_details
+        UNION ALL SELECT 'reviewers', COUNT(*)::bigint FROM reviewers
+        UNION ALL SELECT 'reviews', COUNT(*)::bigint FROM reviews
+        UNION ALL SELECT 'review_category_scores', COUNT(*)::bigint FROM review_category_scores
+        UNION ALL SELECT 'amenities', COUNT(*)::bigint FROM amenities
+        UNION ALL SELECT 'place_source_amenities', COUNT(*)::bigint FROM place_source_amenities
+        UNION ALL SELECT 'locations', COUNT(*)::bigint FROM locations
+        UNION ALL SELECT 'scraping_runs', COUNT(*)::bigint FROM scraping_runs
+        UNION ALL SELECT 'scraping_logs', COUNT(*)::bigint FROM scraping_logs
+        ORDER BY entity
+        """
+    )
+
+
 def data_quality() -> pd.DataFrame:
     return query_dataframe(
         """
         WITH metrics AS (
             SELECT
-                'Places without coordinates' AS metric,
+                'Reviews with non-empty text' AS metric,
                 COUNT(*) FILTER (
-                    WHERE COALESCE(p.latitude, psr.latitude) IS NULL
-                       OR COALESCE(p.longitude, psr.longitude) IS NULL
-                )::bigint AS issue_count,
-                COUNT(*)::bigint AS total_count
+                    WHERE COALESCE(NULLIF(TRIM(review_text), ''), NULLIF(TRIM(positive_text), ''), NULLIF(TRIM(negative_text), '')) IS NOT NULL
+                )::bigint AS numerator,
+                COUNT(*)::bigint AS denominator
+            FROM reviews
+
+            UNION ALL
+
+            SELECT
+                'Reviews with rating',
+                COUNT(*) FILTER (WHERE review_score IS NOT NULL)::bigint,
+                COUNT(*)::bigint
+            FROM reviews
+
+            UNION ALL
+
+            SELECT
+                'Places with location information',
+                COUNT(DISTINCT p.place_id) FILTER (
+                    WHERE p.location_id IS NOT NULL
+                       OR COALESCE(p.latitude, psr.latitude) IS NOT NULL
+                       OR COALESCE(p.longitude, psr.longitude) IS NOT NULL
+                )::bigint,
+                COUNT(DISTINCT p.place_id)::bigint
             FROM places p
             LEFT JOIN place_source_records psr ON psr.place_id = p.place_id
 
             UNION ALL
 
             SELECT
-                'Source listings without reviews' AS metric,
-                COUNT(*) FILTER (WHERE review_totals.review_count = 0)::bigint AS issue_count,
-                COUNT(*)::bigint AS total_count
-            FROM place_source_records psr
-            LEFT JOIN (
-                SELECT place_source_id, COUNT(*) AS review_count
-                FROM reviews
-                GROUP BY place_source_id
-            ) review_totals ON review_totals.place_source_id = psr.place_source_id
+                'Source records with source IDs',
+                COUNT(*) FILTER (WHERE source_place_id IS NOT NULL AND source_place_id <> '')::bigint,
+                COUNT(*)::bigint
+            FROM place_source_records
 
             UNION ALL
 
             SELECT
-                'Reviews without source_review_id' AS metric,
-                COUNT(*) FILTER (WHERE source_review_id IS NULL OR source_review_id = '')::bigint AS issue_count,
-                COUNT(*)::bigint AS total_count
-            FROM reviews
-
-            UNION ALL
-
-            SELECT
-                'Reviews without language' AS metric,
-                COUNT(*) FILTER (WHERE language_code IS NULL OR language_code = '')::bigint AS issue_count,
-                COUNT(*)::bigint AS total_count
-            FROM reviews
-
-            UNION ALL
-
-            SELECT
-                'Reviews without reviewer' AS metric,
-                COUNT(*) FILTER (WHERE reviewer_id IS NULL)::bigint AS issue_count,
-                COUNT(*)::bigint AS total_count
-            FROM reviews
-
-            UNION ALL
-
-            SELECT
-                'Duplicate source place IDs' AS metric,
-                COALESCE(SUM(duplicate_count - 1), 0)::bigint AS issue_count,
-                COUNT(*)::bigint AS total_count
-            FROM (
-                SELECT source_id, source_place_id, COUNT(*) AS duplicate_count
-                FROM place_source_records
-                GROUP BY source_id, source_place_id
-                HAVING COUNT(*) > 1
-            ) duplicates
-
-            UNION ALL
-
-            SELECT
-                'Duplicate source review IDs' AS metric,
-                COALESCE(SUM(duplicate_count - 1), 0)::bigint AS issue_count,
-                COUNT(*)::bigint AS total_count
+                'Duplicate source review IDs',
+                COALESCE(SUM(duplicate_count - 1), 0)::bigint,
+                COUNT(*)::bigint
             FROM (
                 SELECT place_source_id, source_review_id, COUNT(*) AS duplicate_count
                 FROM reviews
-                WHERE source_review_id IS NOT NULL
+                WHERE source_review_id IS NOT NULL AND source_review_id <> ''
                 GROUP BY place_source_id, source_review_id
                 HAVING COUNT(*) > 1
             ) duplicates
-
-            UNION ALL
-
-            SELECT
-                'Failed or partial runs' AS metric,
-                COUNT(*) FILTER (WHERE LOWER(status) IN ('failed', 'partial'))::bigint AS issue_count,
-                COUNT(*)::bigint AS total_count
-            FROM scraping_runs
         )
         SELECT
             metric,
-            issue_count,
-            total_count,
+            numerator,
+            denominator,
             CASE
-                WHEN total_count = 0 THEN 0
-                ELSE ROUND((issue_count::numeric / total_count) * 100, 2)
-            END AS issue_percent
+                WHEN denominator = 0 THEN 0
+                ELSE ROUND((numerator::numeric / denominator) * 100, 2)
+            END AS percent
         FROM metrics
-        ORDER BY issue_count DESC, metric
-        """
-    )
-
-
-def database_growth() -> pd.DataFrame:
-    return query_dataframe(
-        """
-        WITH place_growth AS (
-            SELECT DATE_TRUNC('day', created_at)::date AS day, COUNT(*)::bigint AS places_added
-            FROM places
-            GROUP BY day
-        ),
-        review_growth AS (
-            SELECT DATE_TRUNC('day', created_at)::date AS day, COUNT(*)::bigint AS reviews_added
-            FROM reviews
-            GROUP BY day
-        )
-        SELECT
-            COALESCE(place_growth.day, review_growth.day) AS day,
-            COALESCE(place_growth.places_added, 0)::bigint AS places_added,
-            COALESCE(review_growth.reviews_added, 0)::bigint AS reviews_added
-        FROM place_growth
-        FULL OUTER JOIN review_growth ON review_growth.day = place_growth.day
-        ORDER BY day
+        ORDER BY metric
         """
     )
 
@@ -442,12 +689,8 @@ def database_size() -> dict:
 
 
 def filter_options() -> dict[str, list[str]]:
-    sources = query_dataframe(
-        "SELECT source_code FROM sources ORDER BY source_code"
-    )
-    categories = query_dataframe(
-        "SELECT DISTINCT type_group FROM place_types ORDER BY type_group"
-    )
+    sources = query_dataframe("SELECT source_code FROM sources ORDER BY source_code")
+    categories = query_dataframe("SELECT DISTINCT type_group FROM place_types ORDER BY type_group")
     statuses = query_dataframe(
         "SELECT DISTINCT UPPER(status) AS status FROM scraping_runs WHERE status IS NOT NULL ORDER BY status"
     )

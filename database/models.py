@@ -432,14 +432,6 @@ DEFAULT_SOURCES = [
         "source_type": "Travel review platform",
         "is_active": True,
     },
-    {
-        "source_id": "multi",
-        "source_name": "Multiple Sources",
-        "source_code": "MULTI",
-        "base_url": None,
-        "source_type": "Aggregated run",
-        "is_active": True,
-    },
 ]
 
 DEFAULT_PLACE_TYPES = [

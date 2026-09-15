@@ -65,9 +65,9 @@ services:
     build:
       context: ./monitoring_dashboard
     environment:
-      PGHOST: db
-      PGPORT: ${PGPORT:-5432}
-      PGDATABASE: ${PGDATABASE:-zanzibar_booking_data}
+      PGHOST: ${DASHBOARD_PGHOST:-db}
+      PGPORT: ${DASHBOARD_PGPORT:-5432}
+      PGDATABASE: ${DASHBOARD_PGDATABASE:-${PGDATABASE:-zanzibar_booking_data}}
       PGUSER: ${DASHBOARD_DB_USER:-${PGUSER:-postgres}}
       PGPASSWORD: ${DASHBOARD_DB_PASSWORD:-${PGPASSWORD:-change_this_password}}
       DASHBOARD_REFRESH_SECONDS: ${DASHBOARD_REFRESH_SECONDS:-30}
