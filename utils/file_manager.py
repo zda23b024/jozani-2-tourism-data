@@ -48,6 +48,23 @@ def clean_table_rows(table_name: str, rows: list[dict]) -> list[dict]:
     return clean_json_rows(dataframe.to_dict(orient="records"))
 
 
+def write_json_rows(rows: list[dict], path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        handle.write("[\n")
+        for index, row in enumerate(rows):
+            if index:
+                handle.write(",\n")
+            encoded = json.dumps(
+                row,
+                indent=2,
+                ensure_ascii=False,
+                allow_nan=False,
+            )
+            handle.write("  " + encoded.replace("\n", "\n  "))
+        handle.write("\n]\n")
+
+
 def source_from_prefixed_value(value: object) -> str | None:
     text = str(value or "")
     for source_id in PLATFORM_IDS:
@@ -115,18 +132,12 @@ def save_rows_to_paths(
         dataframe.to_csv(fallback_csv, index=False, encoding="utf-8-sig")
         print(f"CSV locked, saved fallback copy: {fallback_csv.resolve()}")
     try:
-        json_path.write_text(
-            json.dumps(clean_rows, indent=2, ensure_ascii=False, allow_nan=False),
-            encoding="utf-8",
-        )
+        write_json_rows(clean_rows, json_path)
     except PermissionError:
         fallback_json = json_path.with_name(
             f"{json_path.stem}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}{json_path.suffix}"
         )
-        fallback_json.write_text(
-            json.dumps(clean_rows, indent=2, ensure_ascii=False, allow_nan=False),
-            encoding="utf-8",
-        )
+        write_json_rows(clean_rows, fallback_json)
         print(f"JSON locked, saved fallback copy: {fallback_json.resolve()}")
     return clean_rows
 
