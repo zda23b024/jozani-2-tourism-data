@@ -60,6 +60,13 @@ def database_url() -> str:
     )
 
 
+def connect_timeout_seconds() -> int:
+    try:
+        return max(1, int(env("DASHBOARD_DB_CONNECT_TIMEOUT", "5")))
+    except ValueError:
+        return 5
+
+
 def refresh_seconds() -> int:
     try:
         return max(10, int(env("DASHBOARD_REFRESH_SECONDS", "30")))
@@ -82,7 +89,11 @@ def assert_select_only(query: str) -> None:
 
 @contextmanager
 def connection():
-    with psycopg.connect(database_url(), row_factory=dict_row) as conn:
+    with psycopg.connect(
+        database_url(),
+        connect_timeout=connect_timeout_seconds(),
+        row_factory=dict_row,
+    ) as conn:
         conn.execute("SET TRANSACTION READ ONLY")
         yield conn
 
