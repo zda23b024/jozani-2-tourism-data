@@ -16,12 +16,17 @@ __pycache__/
 # Browser session/cache
 browser/*_browser_profile/
 !browser/.gitkeep
+*.sqlite
+*.sqlite3
+*.db
 
 # Generated output
 output/csv/*
 output/json/*
 output/debug/
 output/logs/
+output/*.png
+output/*.html
 !output/csv/.gitkeep
 !output/json/.gitkeep
 
@@ -30,6 +35,10 @@ output/logs/
 tmp/
 *.tmp
 *.log
+*.har
+storage_state*.json
+cookies*.json
+session*.json
 
 # Excel lock/temp files
 ~$*.xlsx

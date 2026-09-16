@@ -1,243 +1,166 @@
 # Jozani 2.0 Tourism Data Collector
 
-Jozani 2.0 Tourism Data Collector is a multi-source tourism data acquisition, integration, and monitoring prototype developed as part of the **Jozani 2.0 Tourism Intelligence Platform**.
+Jozani 2.0 Tourism Data Collector is a local-first tourism data acquisition, normalization, PostgreSQL storage, and monitoring project for Zanzibar tourism data.
 
-The project collects structured tourism information and visitor reviews from supported online tourism platforms, normalizes data from different sources into a common structure, stores the resulting records in PostgreSQL, and provides a read-only monitoring dashboard for inspecting the collected dataset and collection status.
-
-The current implementation focuses on tourism data for **Zanzibar, Tanzania**.
-
-Currently supported sources are:
-
-- **Booking.com** — accommodations, attractions, and reviews
-- **Tripadvisor** — hotels, restaurants, attractions, and reviews
-
-For production use, official APIs, partner feeds, licensed datasets, exported data, or other permitted access methods should be preferred where available. Collection should comply with each source's applicable terms, robots rules, rate limits, and access restrictions. The project does not bypass CAPTCHAs or access controls.
-
-## What It Collects
-
-The current data acquisition pipeline supports:
-
-- Hotels and accommodation metadata
-- Tourism attractions and activities
-- Restaurants
-- Visitor and guest reviews
-- Reviewer information
-- Ratings and review metadata
-- Prices and availability where available
-- Amenities and facilities
-- Policies
-- Images and source URLs
-- Source-specific tourism records
-- Collection and scraping metadata
-
-Collected data is standardized and stored in a normalized PostgreSQL database. CSV and JSON outputs, logs, and debugging artifacts are also generated where applicable.
-
-## Project Architecture
-
-The current data flow is:
-
-```text
-Booking.com ──────┐
-                  ├──> Source Collectors
-Tripadvisor ──────┘
-                          │
-                          ▼
-                Parsing & Normalization
-                          │
-                          ▼
-               Deduplication & Mapping
-                          │
-                          ▼
-                     PostgreSQL
-                          │
-                          ▼
-               Monitoring Dashboard
-```
-
-The architecture keeps source-specific records while maintaining normalized tourism entities in PostgreSQL. This allows data from multiple tourism platforms to be integrated without losing the identity of the original source records.
-
-## Run Jozani
-
-On Windows, the normal interface is:
-
-```text
-.\jozani.ps1 <source> <mode>
-```
+The project collects structured tourism places and reviews from supported tourism platforms, normalizes the records into a source-aware PostgreSQL schema, writes CSV/JSON/log outputs, and provides a read-only Streamlit monitoring dashboard.
 
 Supported sources:
 
+- **Booking.com**: accommodations, attractions, reviews
+- **Tripadvisor**: hotels, attractions, restaurants, reviews
+
+For production use, official APIs, partner feeds, licensed datasets, exported data, or other permitted access methods should be preferred where available. Collection should comply with each source's applicable terms, robots rules, rate limits, and access restrictions. The project does not bypass CAPTCHAs or access controls.
+
+## Architecture
+
 ```text
-booking      = accommodations + attractions
-tripadvisor  = hotels + restaurants + attractions
-all          = Booking.com + Tripadvisor
+Booking.com
+    |
+Tripadvisor
+    |
+    v
+Python collectors (local .venv + Playwright)
+    |
+    v
+Parsing, normalization, and deduplication
+    |
+    v
+Local PostgreSQL (localhost:5432)
+    |
+    v
+Streamlit monitoring dashboard (localhost:8501)
 ```
 
-Supported modes:
+PostgreSQL is the source of truth. The dashboard reads live values from PostgreSQL and does not hardcode metrics.
 
-```text
-catalog      = place/listing collection only
-reviews      = review collection only
-all          = catalog + reviews
-```
+## Requirements
 
-Examples:
+- Windows
+- Python 3.12 or compatible Python 3.x
+- Local PostgreSQL
+- Playwright Chromium
+- Python virtual environment at `.venv`
+
+## Setup
+
+Create and activate the local Python environment:
 
 ```powershell
-.\jozani.ps1 booking all
-.\jozani.ps1 booking catalog
-.\jozani.ps1 booking reviews
-
-.\jozani.ps1 tripadvisor all
-.\jozani.ps1 tripadvisor catalog
-.\jozani.ps1 tripadvisor reviews
-
-.\jozani.ps1 all all
-.\jozani.ps1 all catalog
-.\jozani.ps1 all reviews
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+python -m playwright install chromium
 ```
 
-Review commands use existing catalog records from PostgreSQL and do not recollect the catalog.
-
-## Data Collection Design
-
-Booking.com and Tripadvisor use separate source collectors because their page structures, identifiers, review formats, pagination mechanisms, and available metadata differ.
-
-The collected records are transformed into a common normalized representation before being stored in PostgreSQL.
-
-The pipeline includes mechanisms for:
-
-- source-aware place identification
-- review identification and deduplication
-- pagination
-- data normalization
-- structured review extraction
-- fallback review extraction where supported
-- collection logging
-- error handling
-- debugging artifacts
-- PostgreSQL persistence
-
-Collection failures or unavailable review information are not automatically interpreted as confirmed zero-review records.
-
-## Docker
-
-The Docker environment runs the existing backend/data-collection system. There is no FastAPI application and no Alembic configuration in this project.
-
-The Python application creates and updates the PostgreSQL schema using the existing database modules.
-
-Create the Docker environment file:
+Create local configuration:
 
 ```powershell
 Copy-Item .env.example .env
 ```
 
-For Docker, keep:
+Edit `.env` and set your local PostgreSQL credentials:
 
 ```text
-PGHOST=db
-HEADLESS=true
+PGHOST=localhost
+PGPORT=5432
+PGDATABASE=zanzibar_booking_data
+PGUSER=postgres
+PGPASSWORD=change_this_password
 ```
 
-Build the application image and start PostgreSQL:
+Dashboard-specific database settings can use the same database:
 
-```powershell
-docker compose build
-docker compose up -d db
+```text
+DASHBOARD_PGHOST=localhost
+DASHBOARD_PGPORT=5432
+DASHBOARD_PGDATABASE=zanzibar_booking_data
+DASHBOARD_DB_USER=postgres
+DASHBOARD_DB_PASSWORD=change_this_password
 ```
 
-Initialize or update the database schema:
+Do not commit `.env`.
+
+## Database Setup
+
+Initialize or update the existing PostgreSQL schema:
 
 ```powershell
-docker compose run --rm app python database/apply_schema.py
+.\.venv\Scripts\python.exe database\apply_schema.py
 ```
 
-Run validation checks inside Docker:
+This uses the existing schema modules in `database/`. It does not reset or drop collected data.
+
+## Run Collection
+
+The main Python CLI uses flags:
 
 ```powershell
-docker compose run --rm app python tests/docker_db_check.py
-docker compose run --rm app python tests/docker_playwright_check.py
-docker compose run --rm app python -m unittest discover tests
+.\.venv\Scripts\python.exe main.py --catalog --source booking
+.\.venv\Scripts\python.exe main.py --reviews --source booking
+.\.venv\Scripts\python.exe main.py --all --source booking
+
+.\.venv\Scripts\python.exe main.py --catalog --source tripadvisor
+.\.venv\Scripts\python.exe main.py --reviews --source tripadvisor
+.\.venv\Scripts\python.exe main.py --all --source tripadvisor
+
+.\.venv\Scripts\python.exe main.py --catalog --source both
+.\.venv\Scripts\python.exe main.py --reviews --source both
+.\.venv\Scripts\python.exe main.py --all --source both
 ```
 
-Run the collectors through the wrapper:
+The Windows convenience wrapper maps simple positional commands to the same Python CLI:
 
 ```powershell
+.\jozani.ps1 booking catalog
+.\jozani.ps1 booking reviews
 .\jozani.ps1 booking all
+
 .\jozani.ps1 tripadvisor catalog
+.\jozani.ps1 tripadvisor reviews
+.\jozani.ps1 tripadvisor all
+
+.\jozani.ps1 all catalog
 .\jozani.ps1 all reviews
-```
-
-The wrapper accepts the following sources:
-
-```text
-booking
-tripadvisor
-all
-```
-
-and the following modes:
-
-```text
-catalog
-reviews
-all
-```
-
-Terminal output is intentionally concise. Important startup information, collection progress, totals, warnings, and errors remain visible.
-
-Complete run logs are stored in:
-
-```text
-output/logs
-```
-
-Set:
-
-```text
-VERBOSE_LOGS=true
-```
-
-in `.env` when additional troubleshooting output is required.
-
-### Booking Browser
-
-Booking.com collection that requires browser interaction runs through the `booking-browser` service.
-
-The browser can be viewed locally at:
-
-```text
-http://localhost:6080/vnc.html
-```
-
-Tripadvisor collection runs through the `app` service.
-
-When:
-
-```powershell
 .\jozani.ps1 all all
 ```
 
-is used, Booking.com and Tripadvisor collection run sequentially against the shared PostgreSQL database.
+Review commands use existing catalog records from PostgreSQL.
 
-Generated outputs are persisted in the host `output` directory, while browser profiles are stored in the host `browser` directory.
+## Browser Behavior
 
-Stop Docker services with:
+The collectors use local Playwright Chromium.
 
-```powershell
-docker compose down
+```text
+HEADLESS=true
 ```
 
-## Streamlit Monitoring Dashboard
+runs Chromium without opening a visible browser window.
 
-The project includes a separate read-only Streamlit monitoring dashboard.
+```text
+HEADLESS=false
+```
 
-The dashboard reads statistics and tourism data from PostgreSQL. It does **not** start, stop, pause, or modify the collectors.
+opens the local Playwright Chromium browser window on Windows.
 
-Start PostgreSQL and the dashboard:
+Persistent browser profiles are stored under:
+
+```text
+browser/
+```
+
+## Run Dashboard
+
+Start the monitoring dashboard:
 
 ```powershell
-docker compose up -d db
-docker compose up -d dashboard
+.\.venv\Scripts\python.exe -m streamlit run monitoring_dashboard\app.py
+```
+
+or:
+
+```powershell
+.\start-dashboard.ps1
 ```
 
 Open:
@@ -246,35 +169,62 @@ Open:
 http://localhost:8501
 ```
 
-View dashboard logs:
+The dashboard remains read-only and includes:
 
-```powershell
-docker compose logs -f dashboard
-```
+- Overview
+- Data Explorer
+- Reviews
+- Collection Health
+- Database
+- PostgreSQL connection status
+- source coverage and review metrics
 
-Stop only the dashboard:
+## Output
 
-```powershell
-docker compose stop dashboard
-```
-
-The data collectors remain independent and can run while the dashboard is active:
-
-```powershell
-.\jozani.ps1 tripadvisor all
-```
-
-For production environments, a dedicated read-only PostgreSQL account should be used by the dashboard.
-
-An example configuration is provided in:
+Generated files are written under:
 
 ```text
-monitoring_dashboard/create_readonly_user.sql
+output/csv
+output/json
+output/logs
+output/debug
+```
+
+Browser profiles and session/cache files are local runtime artifacts and are ignored by Git.
+
+## Useful Local Checks
+
+Check Python:
+
+```powershell
+.\.venv\Scripts\python.exe --version
+```
+
+Check imports:
+
+```powershell
+.\.venv\Scripts\python.exe -c "import sqlalchemy; import playwright; import streamlit; print('OK')"
+```
+
+Check PostgreSQL connection:
+
+```powershell
+.\.venv\Scripts\python.exe tests\local_db_check.py
+```
+
+Check Playwright Chromium:
+
+```powershell
+.\.venv\Scripts\python.exe tests\local_playwright_check.py
+```
+
+Run automated tests:
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover tests
 ```
 
 ## PostgreSQL Data Model
-
-The PostgreSQL database uses a normalized, source-aware structure for integrating tourism information from multiple platforms.
 
 Important tables include:
 
@@ -294,87 +244,74 @@ Important tables include:
 - `place_policies`
 - `scraping_runs`
 
-### Canonical Places and Source Records
-
-`places` represents normalized tourism entities.
-
-`place_source_records` stores the corresponding source-specific representation from Booking.com, Tripadvisor, or another supported source.
-
-This separation allows the system to retain source provenance while supporting integration and deduplication across multiple tourism platforms.
-
-Reviews are associated with the appropriate source records so that their original platform context is preserved.
+`places` stores normalized tourism entities. `place_source_records` stores the source-specific listing from Booking.com or Tripadvisor. Reviews are linked to source records so source ownership remains clear.
 
 ## Repository Structure
 
 ```text
 jozani-2-tourism-data/
-│
-├── config/                  # Project and environment configuration
-├── database/                # PostgreSQL schema and persistence
-├── monitoring_dashboard/    # Read-only Streamlit monitoring dashboard
-├── normalizers/             # Cross-source data normalization
-├── scraper/
-│   ├── booking/             # Booking.com collectors
-│   └── tripadvisor/         # Tripadvisor collectors
-├── tests/                   # Automated and environment validation tests
-├── utils/                   # Shared utilities
-├── output/                  # Generated data, logs and debugging output
-├── browser/                 # Local browser profiles
-│
-├── main.py                  # Main collection entry point
-├── jozani.ps1               # Windows command wrapper
-├── docker-compose.yml
-├── Dockerfile
-├── requirements.txt
-├── .env.example
-└── README.md
+|
+|-- config/
+|-- database/
+|-- monitoring_dashboard/
+|-- normalizers/
+|-- scraper/
+|   |-- booking/
+|   `-- tripadvisor/
+|-- tests/
+|-- utils/
+|-- output/
+|-- browser/
+|
+|-- .env.example
+|-- .gitignore
+|-- jozani.ps1
+|-- start-dashboard.ps1
+|-- main.py
+|-- README.md
+`-- requirements.txt
 ```
 
-## Monitoring and Validation
+## Current Scope
 
-The system records collection activity and provides information that can be used to monitor:
+This repository focuses on the tourism data acquisition and integration layer:
 
-- collected tourism places
-- source coverage
-- collected reviews
-- collection runs
-- database status
-- review-text availability
-- category distribution
-- recent collection activity
+- multi-source collection
+- source-specific parsing
+- normalization and deduplication
+- PostgreSQL persistence
+- CSV/JSON/log outputs
+- Streamlit monitoring
 
-The dashboard obtains these values directly from PostgreSQL rather than using hard-coded statistics.
+AI analytics, sentiment analysis, predictive intelligence, and a public tourism portal are outside the current scope of this repository.
 
-## Current Status
+## Normal Workflow
 
-Jozani 2.0 Tourism Data Collector is currently a **working development prototype for multi-source tourism data acquisition, normalization, storage, and monitoring**.
+Setup once:
 
-The current phase provides the data foundation required by other components of the broader Jozani 2.0 Tourism Intelligence Platform.
+```text
+create .venv
+install requirements
+install Playwright Chromium
+configure .env
+initialize/verify PostgreSQL
+```
 
-Current implemented capabilities include:
+Daily collection:
 
-- Booking.com tourism data collection
-- Tripadvisor tourism data collection
-- accommodation, attraction, and restaurant collection
-- visitor review collection
-- review pagination and deduplication
-- cross-source data normalization
-- normalized PostgreSQL storage
-- Docker-based execution
-- structured logging and debugging
-- read-only Streamlit monitoring dashboard
+```powershell
+.\jozani.ps1 booking reviews
+.\jozani.ps1 tripadvisor reviews
+```
 
-Future production hardening may include:
+Monitoring:
 
-- scheduled collection execution
-- operational monitoring and alerting
-- production deployment documentation
-- database backup and retention policies
-- multi-destination configuration and management
-- additional authorized tourism data integrations
+```powershell
+.\start-dashboard.ps1
+```
 
-## Project Scope
+Then open:
 
-This repository focuses on the **tourism data acquisition and integration layer** of Jozani 2.0.
-
-AI analytics, sentiment analysis, aspect-based analysis, predictive intelligence, and the final public-facing tourism platform are outside the current implementation scope of this repository.
+```text
+http://localhost:8501
+```

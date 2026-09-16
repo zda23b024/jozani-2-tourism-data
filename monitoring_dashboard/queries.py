@@ -59,26 +59,51 @@ def overview_kpis(filters: Filters) -> dict:
     params = tuple(source_params + category_params)
     values = query_one(
         f"""
+        WITH filtered_records AS (
+            SELECT
+                p.place_id,
+                psr.place_source_id,
+                s.source_id,
+                GREATEST(
+                    COALESCE(psr.last_scraped_at, '-infinity'::timestamptz),
+                    COALESCE(psr.updated_at, '-infinity'::timestamptz),
+                    COALESCE(p.updated_at, '-infinity'::timestamptz)
+                ) AS updated_at
+            FROM places p
+            JOIN place_types pt ON pt.place_type_id = p.place_type_id
+            LEFT JOIN place_source_records psr ON psr.place_id = p.place_id
+            LEFT JOIN sources s ON s.source_id = psr.source_id
+            WHERE 1 = 1
+              {source_sql}
+              {category_sql}
+        ),
+        filtered_reviews AS (
+            SELECT
+                r.review_id,
+                r.created_at,
+                r.review_text,
+                r.positive_text,
+                r.negative_text
+            FROM reviews r
+            JOIN filtered_records fr ON fr.place_source_id = r.place_source_id
+        )
         SELECT
-            COUNT(DISTINCT p.place_id)::bigint AS canonical_places,
-            COUNT(DISTINCT psr.place_source_id)::bigint AS source_records,
-            COUNT(DISTINCT r.review_id)::bigint AS total_reviews,
-            COUNT(DISTINCT r.review_id) FILTER (
-                WHERE COALESCE(NULLIF(TRIM(r.review_text), ''), NULLIF(TRIM(r.positive_text), ''), NULLIF(TRIM(r.negative_text), '')) IS NOT NULL
-            )::bigint AS reviews_with_text,
-            COUNT(DISTINCT s.source_id) FILTER (WHERE psr.place_source_id IS NOT NULL)::bigint AS active_sources,
-            MAX(COALESCE(psr.last_scraped_at, psr.updated_at, r.created_at, p.updated_at)) AS latest_database_update
-        FROM places p
-        JOIN place_types pt ON pt.place_type_id = p.place_type_id
-        LEFT JOIN place_source_records psr ON psr.place_id = p.place_id
-        LEFT JOIN sources s ON s.source_id = psr.source_id
-        LEFT JOIN reviews r ON r.place_source_id = psr.place_source_id
-        WHERE 1 = 1
-          {source_sql}
-          {category_sql}
+            (SELECT COUNT(DISTINCT place_id)::bigint FROM filtered_records) AS canonical_places,
+            (SELECT COUNT(DISTINCT place_source_id)::bigint FROM filtered_records) AS source_records,
+            (SELECT COUNT(*)::bigint FROM filtered_reviews) AS total_reviews,
+            (SELECT COUNT(*)::bigint FROM filtered_reviews
+             WHERE COALESCE(NULLIF(TRIM(review_text), ''), NULLIF(TRIM(positive_text), ''), NULLIF(TRIM(negative_text), '')) IS NOT NULL
+            ) AS reviews_with_text,
+            (SELECT COUNT(DISTINCT source_id)::bigint FROM filtered_records WHERE place_source_id IS NOT NULL) AS active_sources,
+            GREATEST(
+                COALESCE((SELECT MAX(updated_at) FROM filtered_records), '-infinity'::timestamptz),
+                COALESCE((SELECT MAX(created_at) FROM filtered_reviews), '-infinity'::timestamptz)
+            ) AS latest_database_update
         """,
         params,
     )
+    if str(values.get("latest_database_update")) == "-infinity":
+        values["latest_database_update"] = None
     run = query_one(
         """
         SELECT MAX(completed_at) AS last_successful_collection
@@ -103,18 +128,30 @@ def overview_kpis(filters: Filters) -> dict:
 def source_coverage() -> pd.DataFrame:
     return query_dataframe(
         """
+        WITH review_counts AS (
+            SELECT
+                place_source_id,
+                COUNT(*)::bigint AS reviews,
+                MAX(created_at) AS last_review_at
+            FROM reviews
+            GROUP BY place_source_id
+        )
         SELECT
             s.source_code AS source,
             COUNT(DISTINCT psr.place_source_id) FILTER (WHERE pt.type_group = 'Accommodation')::bigint AS accommodations_hotels,
             COUNT(DISTINCT psr.place_source_id) FILTER (WHERE pt.type_group IN ('Attraction', 'Activity'))::bigint AS attractions,
             COUNT(DISTINCT psr.place_source_id) FILTER (WHERE pt.type_group = 'Restaurant')::bigint AS restaurants,
-            COUNT(DISTINCT r.review_id)::bigint AS reviews,
-            MAX(COALESCE(psr.last_scraped_at, psr.updated_at, r.created_at)) AS last_update
+            COALESCE(SUM(rc.reviews), 0)::bigint AS reviews,
+            MAX(GREATEST(
+                COALESCE(psr.last_scraped_at, '-infinity'::timestamptz),
+                COALESCE(psr.updated_at, '-infinity'::timestamptz),
+                COALESCE(rc.last_review_at, '-infinity'::timestamptz)
+            )) AS last_update
         FROM sources s
         LEFT JOIN place_source_records psr ON psr.source_id = s.source_id
         LEFT JOIN places p ON p.place_id = psr.place_id
         LEFT JOIN place_types pt ON pt.place_type_id = p.place_type_id
-        LEFT JOIN reviews r ON r.place_source_id = psr.place_source_id
+        LEFT JOIN review_counts rc ON rc.place_source_id = psr.place_source_id
         GROUP BY s.source_code
         ORDER BY s.source_code
         """

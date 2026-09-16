@@ -10,41 +10,32 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-docker compose up -d db | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "PostgreSQL failed to start."
+$ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Python = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+$Main = Join-Path $ProjectRoot "main.py"
+
+if (-not (Test-Path -LiteralPath $Python)) {
+    Write-Error "Local virtual environment was not found. Create it with: python -m venv .venv"
     exit 1
 }
 
-function Invoke-Collector([string]$SelectedSource, [string]$Service, [bool]$ExposeBrowser) {
-    if ($ExposeBrowser) {
-        docker compose run --quiet-pull --service-ports --rm --no-deps $Service python main.py $SelectedSource $Mode
-    } else {
-        docker compose run --quiet-pull --rm --no-deps $Service python main.py $SelectedSource $Mode
-    }
-    $script:CollectorExitCode = $LASTEXITCODE
-}
-
-if ($Source -eq "all") {
-    Invoke-Collector "booking" "booking-browser" $true
-    $bookingStatus = $script:CollectorExitCode
-    Invoke-Collector "tripadvisor" "app" $false
-    $tripadvisorStatus = $script:CollectorExitCode
-
-    Write-Output ""
-    if ($bookingStatus -eq 0) { Write-Output "Booking.com     SUCCESS" } else { Write-Output "Booking.com     FAILED" }
-    if ($tripadvisorStatus -eq 0) { Write-Output "Tripadvisor     SUCCESS" } else { Write-Output "Tripadvisor     FAILED" }
-    if ($bookingStatus -eq 0 -and $tripadvisorStatus -eq 0) {
-        Write-Output "Overall         SUCCESS"
-        exit 0
-    }
-    Write-Output "Overall         FAILED"
+if (-not (Test-Path -LiteralPath $Main)) {
+    Write-Error "main.py was not found at expected path: $Main"
     exit 1
 }
 
-if ($Source -eq "booking") {
-    Invoke-Collector "booking" "booking-browser" $true
-    exit $script:CollectorExitCode
+$SourceArg = if ($Source -eq "all") { "both" } else { $Source }
+$ModeFlag = switch ($Mode) {
+    "catalog" { "--catalog" }
+    "reviews" { "--reviews" }
+    "all" { "--all" }
 }
-Invoke-Collector "tripadvisor" "app" $false
-exit $script:CollectorExitCode
+
+Push-Location $ProjectRoot
+try {
+    & $Python $Main $ModeFlag --source $SourceArg
+    exit $LASTEXITCODE
+}
+finally {
+    Pop-Location
+}

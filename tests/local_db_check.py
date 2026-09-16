@@ -23,7 +23,7 @@ def main() -> None:
     if result != (1,):
         raise SystemExit(f"Unexpected database response: {result!r}")
 
-    print("Database connection OK.")
+    print("Local PostgreSQL connection OK.")
 
 
 if __name__ == "__main__":

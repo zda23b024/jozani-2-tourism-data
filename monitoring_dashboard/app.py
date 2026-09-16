@@ -206,6 +206,7 @@ def sidebar() -> str:
         "Collection Health": "✦  Collection Health",
         "Database": "◎  Database",
     }
+    labels = {key: key for key in labels}
     reverse_labels = {value: key for key, value in labels.items()}
     page = st.sidebar.radio(
         "Page",
@@ -322,7 +323,7 @@ def render_overview(filters: Filters) -> None:
     with left:
         render_source_coverage(data["coverage"])
     with right:
-        st.markdown('<div class="section-title">Places by Source and Category</div><div class="section-caption">Number of tourism places collected from each source.</div>', unsafe_allow_html=True)
+        st.markdown('<div class="plot-card"><div class="section-title">Places by Source and Category</div><div class="section-caption">Number of tourism places collected from each source.</div></div>', unsafe_allow_html=True)
         frame = _safe_frame(data["places_by_source_category"], ["source_records", "canonical_places"])
         if frame.empty:
             st.info("No place records available for the selected filters.")
@@ -346,10 +347,10 @@ def render_overview(filters: Filters) -> None:
             fig.update_traces(hovertemplate="Source=%{fullData.name}<br>Category=%{x}<br>Count=%{y}<extra></extra>")
             fig.update_traces(texttemplate="%{text:,}", textposition="outside", cliponaxis=False)
             fig.update_layout(
-                height=270,
+                height=218,
                 legend_title_text="",
                 legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                margin=dict(l=8, r=8, t=28, b=8),
+                margin=dict(l=8, r=8, t=24, b=4),
                 plot_bgcolor="#ffffff",
                 paper_bgcolor="#ffffff",
                 yaxis=dict(gridcolor="#EEF2F6", title=None),
@@ -357,39 +358,36 @@ def render_overview(filters: Filters) -> None:
             )
             st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-    left, right = st.columns(2, gap="small")
-    with right:
-        st.markdown('<div class="section-title">Top 10 Most Reviewed Tourism Places</div><div class="section-caption">Ranked by actual stored review rows in PostgreSQL.</div>', unsafe_allow_html=True)
-        top = _safe_frame(data["top_reviewed_places"], ["#", "Stored Reviews"])
-        if not top.empty and "Source" in top.columns:
-            top["Source"] = top["Source"].apply(display_source)
-        dataframe_or_empty(top, "No reviewed places found for the selected filters.")
+    st.markdown('<div class="plot-card"><div class="section-title">Reviews Collected Over Time</div><div class="section-caption">Daily count of reviews collected from each source.</div></div>', unsafe_allow_html=True)
+    frame = _safe_frame(data["reviews_over_time"], ["reviews_collected"])
+    if frame.empty:
+        st.info("No review collection trend is available for this period.")
+    else:
+        fig = px.line(
+            frame,
+            x="collection_day",
+            y="reviews_collected",
+            markers=True,
+            color_discrete_sequence=[CHART_COLORS[0]],
+            labels={"collection_day": "Collection day", "reviews_collected": "Reviews collected"},
+        )
+        fig.update_traces(line=dict(width=2.5, color="#9F1239"), marker=dict(size=5))
+        fig.update_layout(
+            height=188,
+            showlegend=False,
+            margin=dict(l=8, r=8, t=12, b=4),
+            plot_bgcolor="#ffffff",
+            paper_bgcolor="#ffffff",
+            yaxis=dict(gridcolor="#EEF2F6", title=None),
+            xaxis=dict(title=None),
+        )
+        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-    with left:
-        st.markdown('<div class="section-title">Reviews Collected Over Time</div><div class="section-caption">Number of reviews collected per day using reviews.created_at.</div>', unsafe_allow_html=True)
-        frame = _safe_frame(data["reviews_over_time"], ["reviews_collected"])
-        if frame.empty:
-            st.info("No review collection trend is available for this period.")
-        else:
-            fig = px.line(
-                frame,
-                x="collection_day",
-                y="reviews_collected",
-                markers=True,
-                color_discrete_sequence=[CHART_COLORS[0]],
-                labels={"collection_day": "Collection day", "reviews_collected": "Reviews collected"},
-            )
-            fig.update_traces(line=dict(width=2.5, color="#9F1239"), marker=dict(size=5))
-            fig.update_layout(
-                height=270,
-                showlegend=False,
-                margin=dict(l=8, r=8, t=18, b=8),
-                plot_bgcolor="#ffffff",
-                paper_bgcolor="#ffffff",
-                yaxis=dict(gridcolor="#EEF2F6", title=None),
-                xaxis=dict(title=None),
-            )
-            st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    st.markdown('<div class="section-title">Top 10 Most Reviewed Tourism Places</div><div class="section-caption">Ranked by actual stored review rows in PostgreSQL.</div>', unsafe_allow_html=True)
+    top = _safe_frame(data["top_reviewed_places"], ["#", "Stored Reviews"])
+    if not top.empty and "Source" in top.columns:
+        top["Source"] = top["Source"].apply(display_source)
+    dataframe_or_empty(top, "No reviewed places found for the selected filters.")
 
     st.markdown('<div class="section-title">Recent Collection Runs</div><div class="section-caption">Latest data collection runs from all sources.</div>', unsafe_allow_html=True)
     runs = normalize_display_frame(data["recent_runs"])

@@ -1,4 +1,8 @@
 pandas
+plotly
 playwright
 psycopg[binary]
 python-dateutil
+SQLAlchemy
+streamlit
+streamlit-autorefresh

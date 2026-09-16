@@ -1,5 +1,6 @@
 import os
 from contextlib import contextmanager
+from pathlib import Path
 from urllib.parse import quote_plus
 
 import pandas as pd
@@ -24,16 +25,33 @@ def env(name: str, default: str = "") -> str:
     return os.getenv(name, default).strip()
 
 
+def load_env_file() -> None:
+    env_path = Path(__file__).resolve().parents[1] / ".env"
+    if not env_path.exists():
+        return
+
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(
+            key.strip(),
+            value.strip().strip('"').strip("'"),
+        )
+
+
 def database_url() -> str:
+    load_env_file()
     direct_url = env("DATABASE_URL")
     if direct_url:
         return direct_url
 
-    host = env("PGHOST", "db")
-    port = env("PGPORT", "5432")
-    database = env("PGDATABASE", "zanzibar_booking_data")
-    user = env("PGUSER", "postgres")
-    password = env("PGPASSWORD", "")
+    host = env("DASHBOARD_PGHOST", env("PGHOST", "localhost"))
+    port = env("DASHBOARD_PGPORT", env("PGPORT", "5432"))
+    database = env("DASHBOARD_PGDATABASE", env("PGDATABASE", "zanzibar_booking_data"))
+    user = env("DASHBOARD_DB_USER", env("PGUSER", "postgres"))
+    password = env("DASHBOARD_DB_PASSWORD", env("PGPASSWORD", ""))
 
     return (
         f"postgresql://{quote_plus(user)}:"
