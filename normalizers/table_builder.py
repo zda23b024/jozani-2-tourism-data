@@ -234,6 +234,7 @@ def build_master_rows(now: str) -> dict[str, list[dict]]:
 def build_scraping_run(now: str, hotels: list[dict], reviews: list[dict], attractions: list[dict]) -> dict:
     places_count = len(hotels) + len(attractions)
     run_source_ids = {item_source_id(hotel) for hotel in hotels}
+    run_source_ids.update(item_source_id(attraction) for attraction in attractions)
     run_source_ids.update(
         str(review.get("source") or BOOKING_SOURCE_ID).lower()
         for review in reviews
@@ -241,6 +242,8 @@ def build_scraping_run(now: str, hotels: list[dict], reviews: list[dict], attrac
     )
     if len(run_source_ids) == 1:
         source_id = next(iter(run_source_ids))
+    elif not run_source_ids:
+        source_id = BOOKING_SOURCE_ID
     else:
         source_id = BOOKING_SOURCE_ID if BOOKING_SOURCE_ID in run_source_ids else sorted(run_source_ids)[0]
     scraping_run_id = (
